@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Onday fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    header { position: sticky; top: 0; height: 48px; background: #eee; z-index: 10; }
+    #tall { height: 2400px; }
+    #fade { opacity: 0; transition: opacity 400ms; }
+    #fade.shown { opacity: 1; }
+    .group .reveal { opacity: 0; }
+    .group:hover .reveal { opacity: 1; }
+    #slider { position: relative; left: 0; transition: left 500ms linear; }
+    #slider.moved { left: 200px; }
+  </style>
+</head>
+<body>
+  <header><nav aria-label="Main"><a href="/second">Second page</a></nav></header>
+  <main>
+    <h1>Fixture heading</h1>
+    <p id="status">idle</p>
+    <button data-testid="increment" onclick="bump()">Increment</button>
+    <span data-testid="count">0</span>
+    <button data-testid="dup">Duplicate</button>
+    <button data-testid="dup">Duplicate</button>
+    <label>Email <input id="email" type="email" placeholder="you@example.com"></label>
+    <label><input id="agree" type="checkbox"> I agree</label>
+    <select id="flavor" aria-label="Flavor">
+      <option value="">Pick one</option>
+      <option value="van">Vanilla</option>
+      <option value="choc">Chocolate</option>
+    </select>
+    <input id="when" type="date" aria-label="When">
+    <div id="editor" contenteditable="true" role="textbox" aria-label="Editor">draft</div>
+    <input id="upload" type="file" style="display:none">
+    <button id="alert-btn" onclick="document.getElementById('status').textContent = confirm('Proceed?') ? 'confirmed' : 'cancelled'">Ask</button>
+    <button id="fetch-btn" onclick="load()">Load data</button>
+    <button id="fade" onclick="document.getElementById('status').textContent = 'faded-click'">Faded</button>
+    <div class="group"><button class="reveal" onclick="document.getElementById('status').textContent = 'revealed'">Reveal</button></div>
+    <button id="slider" onclick="document.getElementById('status').textContent = 'slid'">Slider</button>
+    <div id="late"></div>
+    <div id="tall"></div>
+    <button id="bottom" onclick="document.getElementById('status').textContent = 'bottom'">Bottom button</button>
+  </main>
+  <script>
+    let count = 0;
+    function bump() { count++; document.querySelector('[data-testid=count]').textContent = String(count); }
+    async function load() {
+      const res = await fetch('/api/data');
+      const body = await res.json();
+      document.getElementById('status').textContent = 'data:' + body.value;
+    }
+    console.log('fixture loaded');
+    setTimeout(() => {
+      const b = document.createElement('button');
+      b.id = 'late-btn';
+      b.textContent = 'Late';
+      b.onclick = () => { document.getElementById('status').textContent = 'late'; };
+      document.getElementById('late').appendChild(b);
+    }, 300);
+    setTimeout(() => document.getElementById('fade').classList.add('shown'), 100);
+    setTimeout(() => document.getElementById('slider').classList.add('moved'), 50);
+  </script>
+</body>
+</html>
