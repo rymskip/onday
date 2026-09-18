@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Frame</title>
+  <style>body { font-family: sans-serif; margin: 12px; }</style>
+</head>
+<body>
+  <button onclick="hit()">Frame action</button>
+  <a data-testid="component-link" onclick="hit()">Component</a>
+  <label>Frame input <input id="frame-input"></label>
+  <p id="frame-status">frame idle</p>
+  <div id="frame-drop" style="width: 160px; height: 30px; border: 1px dashed #999">frame drop</div>
+  <script>
+    let hits = 0;
+    const drop = document.getElementById('frame-drop');
+    drop.addEventListener('dragover', (e) => e.preventDefault());
+    drop.addEventListener('drop', (e) => { e.preventDefault(); document.getElementById('frame-status').textContent = 'dropped ' + e.dataTransfer.getData('text/plain'); });
+    function hit() { hits++; document.getElementById('frame-status').textContent = 'component ' + hits; }
+  </script>
+</body>
+</html>

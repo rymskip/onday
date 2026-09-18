@@ -34,7 +34,7 @@ pub struct LaunchParams {
     )]
     #[serde(default)]
     pub engine: Option<EngineParam>,
-    #[schemars(description = "Run without a window (default: the server's --headed setting)")]
+    #[schemars(description = "Run without a window (default: the server's --headless setting)")]
     #[serde(default)]
     pub headless: Option<bool>,
     #[schemars(description = "Viewport width in CSS pixels")]
