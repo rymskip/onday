@@ -19,49 +19,65 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const INDEX: &str = include_str!("fixture/index.html");
 const SECOND: &str = include_str!("fixture/second.html");
+const FRAME: &str = include_str!("fixture/frame.html");
 
+/// The fixture served from `127.0.0.1`, embedding a frame served from `localhost`: a
+/// different site, so the browser treats that frame as cross-origin.
 async fn serve() -> Result<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind the fixture server")?;
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind the cross-origin fixture server")?;
+    let remote_origin = format!(
+        "http://localhost:{}",
+        remote.local_addr().context("cross-origin address")?.port()
+    );
     let address = listener.local_addr().context("fixture address")?;
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => request.extend_from_slice(&buffer[..read]),
-                    }
-                }
-                let head = String::from_utf8_lossy(&request);
-                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let (status, kind, body) = match path.as_str() {
-                    "/" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
-                    "/second" => ("200 OK", "text/html; charset=utf-8", SECOND.to_string()),
-                    "/api/data" => (
-                        "200 OK",
-                        "application/json",
-                        r#"{"value":"real"}"#.to_string(),
-                    ),
-                    _ => ("404 Not Found", "text/plain", "missing".to_string()),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                if let Err(error) = stream.write_all(response.as_bytes()).await {
-                    eprintln!("fixture write failed: {error}");
-                }
-            });
-        }
-    });
+    let index = Arc::new(INDEX.replace("__CROSS_ORIGIN__", &remote_origin));
+    tokio::spawn(accept(listener, index.clone()));
+    tokio::spawn(accept(remote, index));
     Ok(format!("http://{address}"))
+}
+
+async fn accept(listener: tokio::net::TcpListener, index: Arc<String>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let index = index.clone();
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let head = String::from_utf8_lossy(&request);
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let (status, kind, body) = match path.as_str() {
+                "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
+                "/second" => ("200 OK", "text/html; charset=utf-8", SECOND.to_string()),
+                "/frame" => ("200 OK", "text/html; charset=utf-8", FRAME.to_string()),
+                "/api/data" => (
+                    "200 OK",
+                    "application/json",
+                    r#"{"value":"real"}"#.to_string(),
+                ),
+                _ => ("404 Not Found", "text/plain", "missing".to_string()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if let Err(error) = stream.write_all(response.as_bytes()).await {
+                eprintln!("fixture write failed: {error}");
+            }
+        });
+    }
 }
 
 struct FixtureHooks;
@@ -100,6 +116,15 @@ fn ref_of(snapshot: &str, needle: &str) -> Result<String> {
     let start = line.find("[ref=").context("line has no ref")? + 5;
     let end = line[start..].find(']').context("unterminated ref")? + start;
     Ok(line[start..end].to_string())
+}
+
+/// The ref of the first line containing `needle` below the line containing `anchor`.
+fn ref_after(snapshot: &str, anchor: &str, needle: &str) -> Result<String> {
+    let below = snapshot
+        .find(anchor)
+        .map(|at| &snapshot[at..])
+        .with_context(|| format!("no snapshot line contains {anchor}:\n{snapshot}"))?;
+    ref_of(below, needle)
 }
 
 fn mock_data(request: &onday::InterceptedRequest) -> RouteAction {
@@ -240,7 +265,7 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     expect(&page.locator("#editor"))
         .to_have_text("hello")
         .await?;
-    page.locator("#email").press("Control+A").await?;
+    page.locator("#email").press("ControlOrMeta+A").await?;
     page.keyboard().press("Backspace").await?;
     expect(&page.locator("#email")).to_have_value("").await?;
 
@@ -254,6 +279,83 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     page.get_by_ref(&increment).click().await?;
     expect(&page.get_by_test_id("count"))
         .to_have_text("3")
+        .await?;
+
+    // Same-origin frames: snapshot refs and selectors reach inside, and only on request.
+    let canvas = page.locator(r#"iframe[title="Canvas"]"#);
+    let frame_status = canvas.locator("#frame-status");
+    expect(&frame_status).to_have_text("frame idle").await?;
+    let snapshot = page.snapshot().await?;
+    let action = ref_of(&snapshot, "button \"Frame action\"")?;
+    ensure!(
+        action.starts_with('f'),
+        "frame ref {action} lacks its frame prefix:\n{snapshot}"
+    );
+    page.get_by_ref(&action).click().await?;
+    expect(&frame_status).to_have_text("component 1").await?;
+    canvas.get_by_test_id("component-link").click().await?;
+    expect(&frame_status).to_have_text("component 2").await?;
+    canvas.get_by_label("Frame input").fill("inside").await?;
+    expect(&canvas.locator("#frame-input"))
+        .to_have_value("inside")
+        .await?;
+    page.get_by_test_id("component-link").click().await?;
+    status_is(&page, "parent-component").await?;
+    expect(&frame_status).to_have_text("component 2").await?;
+    match page
+        .locator("iframe >> testid=component-link")
+        .click()
+        .await
+    {
+        Err(error) if error.downcast_ref::<StrictModeViolation>().is_some() => {}
+        other => bail!("entering two frames should be a strict-mode violation, got {other:?}"),
+    }
+    let framed = ref_of(&snapshot, "iframe \"Canvas\"")?;
+    let inner = page.get_by_ref(&framed).snapshot().await?;
+    ensure!(
+        inner.contains("button \"Frame action\""),
+        "iframe subtree snapshot:\n{inner}"
+    );
+    // Cross-origin frames work the same way.
+    let remote = page.locator(r#"iframe[title="Remote"]"#);
+    let remote_status = remote.locator("#frame-status");
+    expect(&remote_status).to_have_text("frame idle").await?;
+    let snapshot = page.snapshot().await?;
+    let remote_action = ref_after(&snapshot, "iframe \"Remote\"", "button \"Frame action\"")?;
+    page.get_by_ref(&remote_action).click().await?;
+    expect(&remote_status).to_have_text("component 1").await?;
+    remote.get_by_test_id("component-link").click().await?;
+    expect(&remote_status).to_have_text("component 2").await?;
+    remote.get_by_label("Frame input").fill("across").await?;
+    expect(&remote.locator("#frame-input"))
+        .to_have_value("across")
+        .await?;
+    let remote_shot = remote.get_by_test_id("component-link").screenshot().await?;
+    ensure!(
+        remote_shot.starts_with(b"\x89PNG"),
+        "cross-origin element shot is not a PNG"
+    );
+    expect(&frame_status).to_have_text("component 2").await?;
+
+    let shot = canvas.get_by_test_id("component-link").screenshot().await?;
+    ensure!(
+        shot.starts_with(b"\x89PNG"),
+        "framed element shot is not a PNG"
+    );
+
+    // Drag and drop within the page and into frames of either origin.
+    let source = page.get_by_test_id("drag-source");
+    source.drag_to(&page.locator("#drop-zone")).await?;
+    expect(&page.locator("#drop-zone"))
+        .to_have_text("dropped payload")
+        .await?;
+    source.drag_to(&canvas.locator("#frame-drop")).await?;
+    expect(&frame_status)
+        .to_have_text("dropped payload")
+        .await?;
+    source.drag_to(&remote.locator("#frame-drop")).await?;
+    expect(&remote_status)
+        .to_have_text("dropped payload")
         .await?;
 
     // Dialogs.

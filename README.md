@@ -46,9 +46,21 @@ Every action waits until its element is actionable before acting:
 4. It checks that nothing else would receive the pointer at the click point.
 5. It sends real pointer and key input.
 
+HTML5 drag-and-drop is the exception. Only Chromium's BiDi driver finishes a native drag
+from WebDriver input, and none carries one across frames. When the native drag does not
+end, `drag_to` fires `dragstart` through `dragend` in the pages itself, copying the
+`DataTransfer` data into the target's frame.
+
 Selectors are CSS by default. There are also `text=`, `role=button[name="Save"]`,
 `testid=`, `label=`, `placeholder=`, `ref=` (from an aria snapshot) and `nth=`, and any
 of them can be chained with `>>`.
+
+Frames are part of the page, whatever their origin. An aria snapshot nests each frame's
+tree under its `iframe` entry, with refs such as `f1e3` that lead back into that frame. A
+chain enters a frame when a step follows one, as in `iframe[title="Editor"] >> testid=save`,
+and the rest of the chain resolves inside the frame. Matching more than one frame is a
+strict-mode violation. Without an entering step, a selector searches only the top
+document.
 
 `AppHooks` lets an application supply its own conventions: the test-id attribute, init
 scripts, a readiness predicate for `WaitUntil::Ready`, hover-reveal containers, and which
@@ -63,7 +75,8 @@ cargo install --path crates/onday_mcp
 onday_mcp --help
 ```
 
-Each process owns `.onday/<session>/`:
+Each process owns `.onday/<session>/`, created by its first browser tool, so starting
+the server leaves nothing behind in the working directory:
 
 - `session.json`
 - `lock`: an OS file lock, released when the process dies.
@@ -71,7 +84,11 @@ Each process owns `.onday/<session>/`:
 - `logs/{console,network,driver,mcp}.log`
 - `screenshots/`, `downloads/`, `snapshots/`
 
-`--session` (or `ONDAY_SESSION`) names the session; otherwise the name is generated.
+The browser window is visible by default; `--headless` (or `ONDAY_HEADLESS`) hides it.
+
+`--session` (or `ONDAY_SESSION`) names the session; otherwise the name is generated. A
+session another live process holds is reported by the first browser tool. Until the
+directory exists, the server logs to stderr.
 
 The tools follow playwright-mcp's names, plus:
 

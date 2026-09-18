@@ -19,6 +19,9 @@ pub enum LocalValue {
     Boolean {
         value: bool,
     },
+    Number {
+        value: i64,
+    },
     Null,
     Array {
         value: Vec<LocalValue>,
@@ -85,8 +88,16 @@ pub enum RemoteValue {
         #[serde(rename = "sharedId", default)]
         shared_id: Option<String>,
     },
+    Window {
+        value: WindowProxy,
+    },
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WindowProxy {
+    pub context: BrowsingContextId,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,7 +212,15 @@ impl BidiCommand for CaptureScreenshot {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ScreenshotClip {
-    Element { element: SharedRef },
+    Element {
+        element: SharedRef,
+    },
+    Box {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
 }
 
 // ── network ─────────────────────────────────────────────────────────────────

@@ -33,7 +33,13 @@ for (let __pass = 0; __pass < 3; __pass++) {
     );
     // An ancestor coming back means the target is not hit-testable; scrolling cannot fix that.
     if (!__hit || __hit === el || el.contains(__hit) || __hit.contains(el)) break;
-    const __hr = __hit.getBoundingClientRect();
+    // Clear the whole sticky or fixed bar, not just the piece of it that was hit.
+    let __cover = __hit;
+    for (let __p = __hit; __p && __p !== document.body; __p = __p.parentElement) {
+        const __pos = getComputedStyle(__p).position;
+        if (__pos === 'sticky' || __pos === 'fixed') __cover = __p;
+    }
+    const __hr = __cover.getBoundingClientRect();
     let __fix = 0;
     if (__hr.top <= __r.top && __hr.bottom > __r.top) __fix = __hr.bottom - __r.top;
     else if (__hr.bottom >= __r.bottom && __hr.top < __r.bottom) __fix = __hr.top - __r.bottom;

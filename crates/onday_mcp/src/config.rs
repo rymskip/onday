@@ -24,9 +24,9 @@ pub struct Config {
     #[arg(long, env = "ONDAY_ENGINE", default_value = "chromium")]
     pub engine: Engine,
 
-    /// Show the browser window.
-    #[arg(long, env = "ONDAY_HEADED", value_parser = FalseyValueParser::new())]
-    pub headed: bool,
+    /// Run the browser without a window; by default it is visible.
+    #[arg(long, env = "ONDAY_HEADLESS", value_parser = FalseyValueParser::new())]
+    pub headless: bool,
 
     /// Viewport as WIDTHxHEIGHT.
     #[arg(long, env = "ONDAY_VIEWPORT", default_value = "1280x800", value_parser = parse_viewport)]

@@ -42,6 +42,13 @@
     <div id="late"></div>
     <div id="tall"></div>
     <button id="bottom" onclick="document.getElementById('status').textContent = 'bottom'">Bottom button</button>
+    <a data-testid="component-link" onclick="document.getElementById('status').textContent = 'parent-component'">Parent component</a>
+    <div id="drag-source" data-testid="drag-source" draggable="true" style="display: inline-block; padding: 8px; background: #ddd">Drag me</div>
+    <div id="drop-zone" style="display: inline-block; width: 200px; height: 40px; border: 1px dashed #999">drop here</div>
+    <br>
+    <iframe title="Canvas" src="/frame" style="border: 3px solid #999; padding: 6px; width: 420px; height: 180px"></iframe>
+    <iframe title="Other" src="/frame" width="320" height="160"></iframe>
+    <iframe title="Remote" src="__CROSS_ORIGIN__/frame" width="320" height="160"></iframe>
   </main>
   <script>
     let count = 0;
@@ -51,6 +58,10 @@
       const body = await res.json();
       document.getElementById('status').textContent = 'data:' + body.value;
     }
+    document.getElementById('drag-source').addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', 'payload'));
+    const zone = document.getElementById('drop-zone');
+    zone.addEventListener('dragover', (e) => e.preventDefault());
+    zone.addEventListener('drop', (e) => { e.preventDefault(); zone.textContent = 'dropped ' + e.dataTransfer.getData('text/plain'); });
     console.log('fixture loaded');
     setTimeout(() => {
       const b = document.createElement('button');

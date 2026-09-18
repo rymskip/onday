@@ -262,10 +262,11 @@
         return now == null ? null : now;
     }
 
-    function refFor(el) {
+    // `prefix` names the frame (`f1`, …; empty for the top document) so a ref routes back to it.
+    function refFor(el, prefix) {
         let ref = refOf.get(el);
         if (!ref) {
-            ref = 'e' + nextRef++;
+            ref = (prefix || '') + 'e' + nextRef++;
             refOf.set(el, ref);
         }
         refs.set(ref, new WeakRef(el));
@@ -298,7 +299,8 @@
                 continue;
             }
             budget.left--;
-            const entry = { role, name: accName(child), ref: refFor(child), states: states(child, role), children: [] };
+            const entry = { role, name: accName(child), ref: refFor(child, budget.prefix), states: states(child, role), children: [] };
+            if (role === 'iframe' && hasContent(child)) entry.frame = true;
             const value = valueOf(child, role);
             if (value) entry.value = value;
             if (role === 'link' && child.getAttribute('href')) entry.url = child.getAttribute('href');
@@ -307,6 +309,15 @@
             if (entry.children.length === 1 && entry.children[0].text === entry.name) entry.children = [];
             out.push(entry);
         }
+    }
+
+    function isFrame(el) {
+        return el.tagName === 'IFRAME' || el.tagName === 'FRAME';
+    }
+
+    // A frame with a document of its own; the caller reaches it whatever its origin.
+    function hasContent(el) {
+        return isFrame(el) && !!el.contentWindow;
     }
 
     function mergeText(items) {
@@ -319,34 +330,10 @@
         return out;
     }
 
-    function render(items, indent, lines) {
-        const pad = '  '.repeat(indent);
-        for (const item of items) {
-            if (item.text !== undefined) {
-                lines.push(pad + '- text: ' + JSON.stringify(item.text));
-                continue;
-            }
-            let line = pad + '- ' + item.role;
-            if (item.name) line += ' ' + JSON.stringify(item.name);
-            for (const s of item.states) line += ' [' + s + ']';
-            line += ' [ref=' + item.ref + ']';
-            const extra = [];
-            if (item.url) extra.push({ text: null, url: item.url });
-            if (item.value && item.children.length) extra.push({ text: null, value: item.value });
-            if (item.value && !item.children.length && !item.url) line += ': ' + JSON.stringify(item.value);
-            const hasChildren = item.children.length || extra.length;
-            lines.push(hasChildren ? line + ':' : line);
-            for (const e of extra) {
-                if (e.url) lines.push(pad + '  - /url: ' + e.url);
-                if (e.value) lines.push(pad + '  - /value: ' + JSON.stringify(e.value));
-            }
-            render(item.children, indent + 1, lines);
-        }
-    }
-
-    function snapshot(root, maxNodes) {
+    // The tree as data; the caller splices in frame contents and renders it.
+    function snapshot(root, maxNodes, prefix) {
         const start = root || document.body || document.documentElement;
-        const budget = { left: maxNodes || 5000 };
+        const budget = { left: maxNodes, prefix };
         const items = [];
         if (root && root.nodeType === 1 && !SKIP_TAGS.has(root.tagName.toLowerCase())) {
             // Walk a stand-in parent so the root itself is emitted, not just its children.
@@ -354,10 +341,7 @@
         } else {
             buildTree(start, items, budget);
         }
-        const lines = [];
-        render(mergeText(items), 0, lines);
-        if (budget.left <= 0) lines.push('- text: "… snapshot truncated at ' + (maxNodes || 5000) + ' nodes; snapshot a ref to see more"');
-        return lines.join('\n');
+        return { items: mergeText(items), truncated: budget.left <= 0 };
     }
 
     // ── selectors ─────────────────────────────────────────────────────────
@@ -568,10 +552,23 @@
         }
     }
 
-    function resolve(selector, testIdAttr, scope) {
-        let current = [scope || document];
-        for (const part of splitChain(selector)) {
-            const { engine, body } = parsePart(part);
+    function refOwner(ref) {
+        const m = /^(f\d+)e\d+$/.exec(ref);
+        return m ? m[1] : '';
+    }
+
+    // Resolve in this document. A tagged array tells the caller where to continue:
+    // ['elements', ...els], ['enter', rest, ...frames] when the chain steps into
+    // frames, or ['frame', prefix, rest] for a ref another frame handed out.
+    function resolve(selector, testIdAttr, prefix) {
+        const parts = splitChain(selector);
+        let current = [document];
+        for (let i = 0; i < parts.length; i++) {
+            const { engine, body } = parsePart(parts[i]);
+            if (engine === 'ref') {
+                const owner = refOwner(unquote(body));
+                if (owner !== prefix) return ['frame', owner, parts.slice(i).join(' >> ')];
+            }
             if (engine === 'nth') {
                 const n = parseInt(body, 10);
                 const idx = n < 0 ? current.length + n : n;
@@ -588,6 +585,9 @@
                 current = current.filter(e => matcher(elementText(e) || ''));
                 continue;
             }
+            if (current.length && current.every(e => e.nodeType === 1 && hasContent(e))) {
+                return ['enter', parts.slice(i).join(' >> '), ...current];
+            }
             const seen = new Set();
             const next = [];
             for (const root of current) {
@@ -597,7 +597,7 @@
             }
             current = next;
         }
-        return current.filter(n => n && n.nodeType === 1);
+        return ['elements', ...current.filter(n => n && n.nodeType === 1)];
     }
 
     // ── actionability ─────────────────────────────────────────────────────
@@ -630,8 +630,8 @@
         /*__PRESCROLL__*/
     }
 
-    function deepHit(x, y) {
-        let hit = document.elementFromPoint(x, y);
+    function deepHit(doc, x, y) {
+        let hit = doc.elementFromPoint(x, y);
         while (hit && hit.shadowRoot) {
             const inner = hit.shadowRoot.elementFromPoint(x, y);
             if (!inner || inner === hit) break;
@@ -647,6 +647,7 @@
         return false;
     }
 
+    // The element's centre in this document's viewport, and whether a pointer there hits it.
     function hitPoint(el) {
         if (!el || !el.isConnected) return { ok: false, reason: 'detached from the document', x: 0, y: 0, outside: false };
         const r = el.getBoundingClientRect();
@@ -656,15 +657,114 @@
             return { ok: false, reason: 'outside the viewport', x: Math.round(r.left), y: Math.round(r.top), outside: true };
         }
         const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
-        const hit = deepHit(x, y);
+        const hit = deepHit(document, x, y);
         if (!hit) return { ok: false, reason: 'nothing at (' + x + ', ' + y + ')', x, y, outside: false };
         if (composedContains(el, hit) || composedContains(hit, el)) return { ok: true, reason: '', x, y, outside: false };
         if (hit.tagName === 'LABEL' && hit.control === el) return { ok: true, reason: '', x, y, outside: false };
         return { ok: false, reason: describe(hit) + ' intercepts pointer events at (' + x + ', ' + y + ')', x, y, outside: false };
     }
 
+    // Where the frame's content box starts in this document's viewport. Measured from
+    // the parent side so it holds for cross-origin frames too.
+    function frameOffset(frame) {
+        const r = frame.getBoundingClientRect();
+        const cs = getComputedStyle(frame);
+        return [r.left + frame.clientLeft + parseFloat(cs.paddingLeft), r.top + frame.clientTop + parseFloat(cs.paddingTop)];
+    }
+
+    // Carry a point in the frame's viewport into this one, checking the frame receives it.
+    function frameHit(frame, x, y) {
+        const [dx, dy] = frameOffset(frame);
+        const px = Math.floor(x + dx), py = Math.floor(y + dy);
+        if (px < 0 || py < 0 || px >= window.innerWidth || py >= window.innerHeight) {
+            return { ok: false, reason: describe(frame) + ' is outside the viewport', x: px, y: py, outside: true };
+        }
+        const hit = deepHit(document, px, py);
+        if (hit !== frame) {
+            return { ok: false, reason: (hit ? describe(hit) : 'nothing') + ' intercepts pointer events over ' + describe(frame) + ' at (' + px + ', ' + py + ')', x: px, y: py, outside: false };
+        }
+        return { ok: true, reason: '', x: px, y: py, outside: false };
+    }
+
+    // Scroll this document until a point in the frame's viewport is on screen, then
+    // report where it landed.
+    function revealFrame(frame, x, y) {
+        frame.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        const [dx, dy] = frameOffset(frame);
+        const px = x + dx, py = y + dy;
+        if (py < 0 || py >= window.innerHeight) window.scrollBy(0, py - window.innerHeight / 2);
+        if (px < 0 || px >= window.innerWidth) window.scrollBy(px - window.innerWidth / 2, 0);
+        return frameHit(frame, x, y);
+    }
+
     function scrollIntoViewIfNeeded(el) {
         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    }
+
+    // ── drag and drop ─────────────────────────────────────────────────────
+    // Drivers other than Chromium's BiDi never start an HTML5 drag from WebDriver
+    // input, and none carries one across frames; these fire the drag events in the
+    // pages instead, with the data copied between frames.
+    function dragSource(el) {
+        return el.closest('[draggable="true"]');
+    }
+
+    // A native drag counts only once it ends: Firefox starts one from WebDriver input
+    // and then never delivers its drop or dragend.
+    function watchDrag() {
+        window.__ondayNativeDrag = false;
+        window.addEventListener('dragend', (e) => { if (e.isTrusted) window.__ondayNativeDrag = true; }, { capture: true, once: true });
+    }
+
+    function nativeDragEnded(waitMs) {
+        return new Promise((resolve) => {
+            const started = Date.now();
+            const check = () => {
+                if (window.__ondayNativeDrag === true) resolve(true);
+                else if (Date.now() - started >= waitMs) resolve(false);
+                else setTimeout(check, 25);
+            };
+            check();
+        });
+    }
+
+    function dragInit(dataTransfer, x, y, cancelable) {
+        return { bubbles: true, cancelable, composed: true, clientX: x, clientY: y, dataTransfer };
+    }
+
+    function startDrag(el, x, y) {
+        const source = dragSource(el);
+        const dataTransfer = new DataTransfer();
+        if (!source.dispatchEvent(new DragEvent('dragstart', dragInit(dataTransfer, x, y, true)))) {
+            return { started: false, items: [], effectAllowed: 'none' };
+        }
+        source.dispatchEvent(new DragEvent('drag', dragInit(dataTransfer, x, y, true)));
+        window.__ondayDrag = { source, dataTransfer };
+        const items = Array.from(dataTransfer.types).map(type => [type, dataTransfer.getData(type)]);
+        return { started: true, items, effectAllowed: dataTransfer.effectAllowed };
+    }
+
+    // Returns the drop effect, or 'none' when the element under the point refused it.
+    function dropAt(el, x, y, items, effectAllowed) {
+        const target = deepHit(document, x, y) || el;
+        const dataTransfer = new DataTransfer();
+        for (const [type, value] of items) dataTransfer.setData(type, value);
+        dataTransfer.effectAllowed = effectAllowed;
+        target.dispatchEvent(new DragEvent('dragenter', dragInit(dataTransfer, x, y, true)));
+        if (target.dispatchEvent(new DragEvent('dragover', dragInit(dataTransfer, x, y, true)))) {
+            target.dispatchEvent(new DragEvent('dragleave', dragInit(dataTransfer, x, y, false)));
+            return 'none';
+        }
+        target.dispatchEvent(new DragEvent('drop', dragInit(dataTransfer, x, y, true)));
+        return dataTransfer.dropEffect === 'none' ? 'move' : dataTransfer.dropEffect;
+    }
+
+    function endDrag(x, y, dropEffect) {
+        const drag = window.__ondayDrag;
+        if (!drag) throw new Error('no drag in progress in this document');
+        delete window.__ondayDrag;
+        drag.dataTransfer.dropEffect = dropEffect;
+        drag.source.dispatchEvent(new DragEvent('dragend', dragInit(drag.dataTransfer, x, y, false)));
     }
 
     // ── form helpers ──────────────────────────────────────────────────────
@@ -828,7 +928,16 @@
         probe,
         prescroll,
         hitPoint,
+        frameOffset,
+        frameHit,
+        revealFrame,
         scrollIntoViewIfNeeded,
+        dragSource,
+        watchDrag,
+        nativeDragEnded,
+        startDrag,
+        dropAt,
+        endDrag,
         clearForTyping,
         fillDirect,
         selectOptions,

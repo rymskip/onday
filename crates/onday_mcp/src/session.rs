@@ -1,21 +1,103 @@
-//! The session directory: `<output-dir>/<id>/` with its lock, metadata, profile,
-//! logs, screenshots and downloads.
+//! The session: its id, and the directory `<output-dir>/<id>/` with its lock,
+//! metadata, profile, logs, screenshots and downloads. The directory is created by
+//! the first tool that needs it, so a server started in a project leaves nothing
+//! behind until a browser tool runs.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, RandomState};
-use std::io::Write as _;
+use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use onday::{ConsoleMessage, Engine, NetworkEntry};
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tokio::sync::OnceCell;
+use tracing_subscriber::fmt::MakeWriter;
 
-pub struct SessionDir {
+pub struct Session {
     pub id: String,
     pub root: PathBuf,
+    log: McpLog,
+    dir: OnceCell<Arc<SessionDir>>,
+}
+
+impl Session {
+    /// Settle the id and location without touching the filesystem.
+    pub fn new(output_dir: &Path, id: Option<String>, log: McpLog) -> Result<Session> {
+        let id = match id {
+            Some(id) => validate_id(id)?,
+            None => generated_id()?,
+        };
+        let root = absolute(&output_dir.join(&id))?;
+        Ok(Session {
+            id,
+            root,
+            log,
+            dir: OnceCell::new(),
+        })
+    }
+
+    /// The session directory, created and locked on first use.
+    pub async fn dir(&self) -> Result<Arc<SessionDir>> {
+        self.dir
+            .get_or_try_init(|| async {
+                SessionDir::open(&self.id, &self.root, &self.log).map(Arc::new)
+            })
+            .await
+            .cloned()
+    }
+
+    /// The session directory if a tool has created it.
+    pub fn opened(&self) -> Option<&Arc<SessionDir>> {
+        self.dir.get()
+    }
+}
+
+/// Tracing output: stderr until the session directory exists, then `logs/mcp.log`.
+#[derive(Clone, Default)]
+pub struct McpLog(Arc<OnceLock<Mutex<File>>>);
+
+pub enum McpLogWriter<'a> {
+    File(MutexGuard<'a, File>),
+    Stderr(std::io::Stderr),
+}
+
+impl Write for McpLogWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            McpLogWriter::File(file) => file.write(buf),
+            McpLogWriter::Stderr(stderr) => stderr.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            McpLogWriter::File(file) => file.flush(),
+            McpLogWriter::Stderr(stderr) => stderr.flush(),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for McpLog {
+    type Writer = McpLogWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        match self.0.get() {
+            Some(file) => {
+                McpLogWriter::File(file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+            }
+            None => McpLogWriter::Stderr(std::io::stderr()),
+        }
+    }
+}
+
+pub struct SessionDir {
+    id: String,
+    root: PathBuf,
     // Held for the process lifetime; the OS releases it if the process dies.
     lock: File,
     console_log: Mutex<File>,
@@ -33,13 +115,8 @@ struct Metadata<'a> {
 }
 
 impl SessionDir {
-    /// Create (or reclaim) the session directory and take its lock.
-    pub fn open(output_dir: &Path, id: Option<String>) -> Result<SessionDir> {
-        let id = match id {
-            Some(id) => validate_id(id)?,
-            None => generated_id()?,
-        };
-        let root = absolute(&output_dir.join(&id))?;
+    /// Create (or reclaim) the session directory, take its lock and start `logs/mcp.log`.
+    fn open(id: &str, root: &Path, log: &McpLog) -> Result<SessionDir> {
         for dir in ["logs", "screenshots", "downloads", "snapshots"] {
             std::fs::create_dir_all(root.join(dir))
                 .with_context(|| format!("create {}", root.join(dir).display()))?;
@@ -55,10 +132,11 @@ impl SessionDir {
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let holder = std::fs::read_to_string(&lock_path).unwrap_or_default();
+                let holder = std::fs::read_to_string(&lock_path)
+                    .map(|pid| pid.trim().to_string())
+                    .unwrap_or_else(|error| format!("unreadable: {error}"));
                 bail!(
-                    "session {id} is in use by another onday_mcp (pid {}); pick another --session",
-                    holder.trim()
+                    "session {id} is in use by another onday_mcp (pid {holder}); pick another --session"
                 );
             }
             Err(TryLockError::Error(error)) => {
@@ -69,14 +147,19 @@ impl SessionDir {
         write!(lock, "{}", std::process::id()).context("record the pid in the lock file")?;
         let console_log = append(&root.join("logs/console.log"))?;
         let network_log = append(&root.join("logs/network.log"))?;
+        let mcp_log = append(&root.join("logs/mcp.log"))?;
         let dir = SessionDir {
-            id,
-            root,
+            id: id.to_string(),
+            root: root.to_path_buf(),
             lock,
             console_log: Mutex::new(console_log),
             network_log: Mutex::new(network_log),
         };
         dir.write_metadata(None, None)?;
+        if log.0.set(Mutex::new(mcp_log)).is_err() {
+            bail!("the MCP log was already redirected to a session directory");
+        }
+        tracing::info!("session {id} at {}", root.display());
         Ok(dir)
     }
 
@@ -86,10 +169,6 @@ impl SessionDir {
 
     pub fn driver_log(&self) -> PathBuf {
         self.root.join("logs/driver.log")
-    }
-
-    pub fn mcp_log(&self) -> PathBuf {
-        self.root.join("logs/mcp.log")
     }
 
     pub fn screenshots(&self) -> PathBuf {
@@ -109,8 +188,9 @@ impl SessionDir {
             id: &self.id,
             pid: std::process::id(),
             cwd: std::env::current_dir()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_default(),
+                .context("read the working directory")?
+                .display()
+                .to_string(),
             started_at: now()?,
             engine,
             protocol,
@@ -152,12 +232,13 @@ impl SessionDir {
 
     /// The pid holding this session, for status output.
     pub fn holder(&self) -> Result<String> {
-        let mut text = String::new();
-        use std::io::Read as _;
-        (&self.lock)
-            .read_to_string(&mut text)
+        // Positional: the handle's cursor sits past the pid it wrote.
+        let length = self.lock.metadata().context("stat the lock file")?.len();
+        let mut pid = vec![0; usize::try_from(length).context("size the lock file")?];
+        self.lock
+            .read_exact_at(&mut pid, 0)
             .context("read the lock file")?;
-        Ok(text)
+        String::from_utf8(pid).context("decode the lock file")
     }
 }
 
@@ -225,15 +306,42 @@ mod tests {
         assert!(validate_id("session1".to_string()).is_ok());
     }
 
-    #[test]
-    fn a_second_process_cannot_take_a_live_session() {
+    fn shared(base: &Path) -> Session {
+        Session::new(base, Some("shared".to_string()), McpLog::default()).expect("new session")
+    }
+
+    #[tokio::test]
+    async fn the_directory_waits_for_first_use() {
+        let base = std::env::temp_dir().join(format!("onday-lazy-test-{}", std::process::id()));
+        let session = shared(&base);
+        assert!(
+            !base.exists(),
+            "constructing a session touched the filesystem"
+        );
+        assert!(session.opened().is_none());
+        let dir = session.dir().await.expect("open on first use");
+        assert!(base.join("shared/logs/mcp.log").exists());
+        assert_eq!(
+            dir.holder().expect("holder"),
+            std::process::id().to_string()
+        );
+        drop(dir);
+        assert!(session.opened().is_some());
+        drop(session);
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    #[tokio::test]
+    async fn a_second_process_cannot_take_a_live_session() {
         let base = std::env::temp_dir().join(format!("onday-lock-test-{}", std::process::id()));
-        let first = SessionDir::open(&base, Some("shared".to_string())).expect("first open");
-        let second = SessionDir::open(&base, Some("shared".to_string()));
-        assert!(second.is_err());
+        let first = shared(&base);
+        first.dir().await.expect("first open");
+        let second = shared(&base);
+        assert!(second.dir().await.is_err());
         drop(first);
-        let third = SessionDir::open(&base, Some("shared".to_string()));
-        assert!(third.is_ok());
+        let third = shared(&base);
+        assert!(third.dir().await.is_ok());
+        drop(third);
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 }

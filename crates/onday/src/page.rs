@@ -20,6 +20,7 @@ use tokio::sync::broadcast;
 
 use crate::context::ContextInner;
 use crate::events::{ConsoleMessage, Dialog, DialogPolicy, NetworkEntry, PageEvents};
+use crate::frame::{Frame, FrameRegistry, FrameTarget};
 use crate::hooks::AppHooks;
 use crate::js;
 use crate::keys::{Chord, key_value, parse_chord};
@@ -42,11 +43,103 @@ pub(crate) enum PageTarget {
     Classic(WindowHandle),
 }
 
-/// A DOM element handle in the page's protocol.
+/// Where a pointer at an element's centre lands, and whether the element receives it.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Hit {
+    pub(crate) ok: bool,
+    pub(crate) reason: String,
+    pub(crate) x: i64,
+    pub(crate) y: i64,
+    pub(crate) outside: bool,
+}
+
+/// An element and a point of it in its frame's viewport. Classic drivers disagree on
+/// which viewport a frame's coordinates mean, so Classic pointer moves are expressed
+/// relative to this element instead, which the spec pins down.
+pub(crate) struct Anchor<'a> {
+    pub(crate) element: &'a ElementRef,
+    pub(crate) x: i64,
+    pub(crate) y: i64,
+}
+
+/// Where a click lands: `(x, y)` in `frame`'s viewport, anchored for Classic input.
+pub(crate) struct ClickPoint<'a> {
+    pub(crate) frame: &'a Frame,
+    pub(crate) anchor: Option<Anchor<'a>>,
+    pub(crate) x: i64,
+    pub(crate) y: i64,
+}
+
+/// A DOM element and the frame whose scripts can use it.
 #[derive(Debug, Clone)]
-pub(crate) enum ElementRef {
+pub(crate) struct ElementRef {
+    pub(crate) frame: Frame,
+    handle: Handle,
+}
+
+/// An element handle in the page's protocol, valid in its own frame only.
+#[derive(Debug, Clone)]
+enum Handle {
     Bidi(String),
     Classic(WebElement),
+}
+
+/// Where a selector resolved in one frame continues.
+#[derive(Debug)]
+pub(crate) enum Resolution {
+    Elements(Vec<ElementRef>),
+    /// The chain stepped into these frames; `rest` resolves inside them.
+    Enter {
+        frames: Vec<ElementRef>,
+        rest: String,
+    },
+    /// A ref handed out by the frame with this prefix.
+    Frame {
+        prefix: String,
+        rest: String,
+    },
+}
+
+/// One entry of the tagged array the runtime's `resolve` returns.
+enum Resolved {
+    Text(String),
+    Element(ElementRef),
+}
+
+impl Resolution {
+    fn parse(items: Vec<Resolved>) -> Result<Resolution> {
+        let mut items = items.into_iter();
+        let mut text = |what: &str| match items.next() {
+            Some(Resolved::Text(text)) => Ok(text),
+            _ => Err(anyhow!("the page runtime's resolution lacks its {what}")),
+        };
+        let tag = text("tag")?;
+        let resolution = match tag.as_str() {
+            "elements" => Resolution::Elements(elements(items)?),
+            "enter" => {
+                let rest = text("remaining selector")?;
+                Resolution::Enter {
+                    frames: elements(items)?,
+                    rest,
+                }
+            }
+            "frame" => Resolution::Frame {
+                prefix: text("frame prefix")?,
+                rest: text("remaining selector")?,
+            },
+            other => bail!("unknown resolution {other:?} from the page runtime"),
+        };
+        Ok(resolution)
+    }
+}
+
+fn elements(items: impl Iterator<Item = Resolved>) -> Result<Vec<ElementRef>> {
+    items
+        .map(|item| match item {
+            Resolved::Element(element) => Ok(element),
+            Resolved::Text(text) => Err(anyhow!("expected an element, got {text:?}")),
+        })
+        .collect()
 }
 
 /// An argument passed into page scripts.
@@ -54,6 +147,7 @@ pub(crate) enum ElementRef {
 pub(crate) enum JsArg {
     Str(String),
     Bool(bool),
+    Int(i64),
     Null,
     Strs(Vec<String>),
     El(ElementRef),
@@ -66,6 +160,7 @@ impl JsArg {
                 value: value.clone(),
             },
             JsArg::Bool(value) => LocalValue::Boolean { value: *value },
+            JsArg::Int(value) => LocalValue::Number { value: *value },
             JsArg::Null => LocalValue::Null,
             JsArg::Strs(values) => LocalValue::Array {
                 value: values
@@ -75,10 +170,16 @@ impl JsArg {
                     })
                     .collect(),
             },
-            JsArg::El(ElementRef::Bidi(shared_id)) => LocalValue::Shared(SharedRef {
+            JsArg::El(ElementRef {
+                handle: Handle::Bidi(shared_id),
+                ..
+            }) => LocalValue::Shared(SharedRef {
                 shared_id: shared_id.clone(),
             }),
-            JsArg::El(ElementRef::Classic(_)) => {
+            JsArg::El(ElementRef {
+                handle: Handle::Classic(_),
+                ..
+            }) => {
                 bail!("a Classic element handle cannot cross into a BiDi call")
             }
         })
@@ -88,14 +189,19 @@ impl JsArg {
         match self {
             JsArg::Str(value) => serde_json::to_value(value).context("serialize script argument"),
             JsArg::Bool(value) => serde_json::to_value(value).context("serialize script argument"),
+            JsArg::Int(value) => serde_json::to_value(value).context("serialize script argument"),
             JsArg::Null => serde_json::to_value(()).context("serialize script argument"),
             JsArg::Strs(values) => {
                 serde_json::to_value(values).context("serialize script argument")
             }
-            JsArg::El(ElementRef::Classic(element)) => {
-                element.to_json().context("serialize element argument")
-            }
-            JsArg::El(ElementRef::Bidi(_)) => {
+            JsArg::El(ElementRef {
+                handle: Handle::Classic(element),
+                ..
+            }) => element.to_json().context("serialize element argument"),
+            JsArg::El(ElementRef {
+                handle: Handle::Bidi(_),
+                ..
+            }) => {
                 bail!("a BiDi element handle cannot cross into a Classic call")
             }
         }
@@ -147,6 +253,7 @@ pub(crate) struct PageInner {
     pub(crate) context: Arc<ContextInner>,
     pub(crate) target: PageTarget,
     pub(crate) events: Arc<PageEvents>,
+    frames: FrameRegistry,
     timeout: Mutex<Duration>,
     closed: AtomicBool,
 }
@@ -200,6 +307,7 @@ impl Page {
                 context,
                 target,
                 events,
+                frames: FrameRegistry::default(),
                 timeout: Mutex::new(DEFAULT_TIMEOUT),
                 closed: AtomicBool::new(false),
             }),
@@ -491,16 +599,18 @@ impl Page {
 
     /// Evaluate an expression, or call a function, and deserialize its JSON-able result.
     pub async fn evaluate<T: DeserializeOwned>(&self, expression: &str) -> Result<T> {
-        self.evaluate_with(expression, Vec::new()).await
+        self.evaluate_with(&Frame::top(), expression, Vec::new())
+            .await
     }
 
     pub(crate) async fn evaluate_with<T: DeserializeOwned>(
         &self,
+        frame: &Frame,
         expression: &str,
         args: Vec<JsArg>,
     ) -> Result<T> {
         let text = self
-            .call_text(|prelude| js::user_call(expression, prelude), args)
+            .call_text(frame, |prelude| js::user_call(expression, prelude), args)
             .await
             .with_context(|| format!("evaluate {}", abbreviate(expression)))?;
         serde_json::from_str(&text)
@@ -536,172 +646,356 @@ impl Page {
             .await
     }
 
-    /// Call `func(lib, ...args)` in the page runtime and decode its JSON result.
+    /// Call `func(lib, ...args)` in the frame's runtime and decode its JSON result.
     pub(crate) async fn call_json<T: DeserializeOwned>(
         &self,
+        frame: &Frame,
         func: &str,
         args: Vec<JsArg>,
     ) -> Result<T> {
         let text = self
-            .call_text(|prelude| js::json_call(func, prelude), args)
+            .call_text(frame, |prelude| js::json_call(func, prelude), args)
             .await?;
         serde_json::from_str(&text).with_context(|| format!("decode page runtime result {text}"))
     }
 
+    /// Call `func(lib, el, ...args)` in the element's own frame and decode its JSON result.
+    pub(crate) async fn call_on<T: DeserializeOwned>(
+        &self,
+        element: &ElementRef,
+        func: &str,
+        args: Vec<JsArg>,
+    ) -> Result<T> {
+        let mut all = vec![JsArg::El(element.clone())];
+        all.extend(args);
+        self.call_json(&element.frame, func, all).await
+    }
+
     async fn call_text(
         &self,
+        frame: &Frame,
         declare: impl Fn(&str) -> String,
         args: Vec<JsArg>,
     ) -> Result<String> {
-        match &self.inner.target {
-            PageTarget::Bidi(context) => {
-                let arguments = args
-                    .iter()
-                    .map(JsArg::to_local)
-                    .collect::<Result<Vec<_>>>()?;
-                let result = self
-                    .bidi_handle()?
-                    .send(CallFunction {
-                        function_declaration: declare(""),
-                        await_promise: true,
-                        target: Target::Context {
-                            context: context.clone(),
-                            sandbox: None,
-                        },
-                        arguments,
-                        user_activation: Some(true),
-                    })
-                    .await
-                    .context("script.callFunction")?;
-                match result {
-                    CallResult::Success {
-                        result: RemoteValue::String { value },
-                    } => Ok(value),
-                    CallResult::Success { result } => {
-                        bail!("expected JSON text from the page, got {result:?}")
+        check_frames(frame, &args)?;
+        let text = match &self.inner.target {
+            PageTarget::Bidi(_) => {
+                let declaration = declare("");
+                self.with_runtime(frame, || async {
+                    let result = self
+                        .bidi_call(frame, declaration.clone(), &args, Some(true))
+                        .await?;
+                    match result {
+                        RemoteValue::String { value } => Ok(present(value)),
+                        other => bail!("expected JSON text from the page, got {other:?}"),
                     }
-                    CallResult::Exception { exception_details } => bail!(
-                        "page script threw at line {}: {}",
-                        exception_details.line_number.unwrap_or(0),
-                        exception_details.text
-                    ),
-                }
+                })
+                .await?
             }
             PageTarget::Classic(_) => {
                 let arguments = args
                     .iter()
                     .map(JsArg::to_classic)
                     .collect::<Result<Vec<_>>>()?;
-                let window = self.classic_window().await?;
-                let prelude = self.classic_prelude();
-                let returned = self
-                    .driver()
-                    .execute(js::classic_body(&declare(&prelude)), arguments)
+                let body = js::classic_body(&declare(&self.classic_prelude(frame)));
+                self.with_runtime(frame, || async {
+                    self.in_classic_frame(frame, || async {
+                        self.driver()
+                            .execute(body.clone(), arguments.clone())
+                            .await
+                            .context("execute script")?
+                            .convert::<String>()
+                            .context("read the script result")
+                    })
                     .await
-                    .context("execute script")?;
-                drop(window);
-                returned
-                    .convert::<String>()
-                    .context("read the script result")
+                    .map(present)
+                })
+                .await?
             }
+        };
+        Ok(text)
+    }
+
+    /// Run a runtime call; when its document lacks the runtime, install it and call again.
+    async fn with_runtime<T, F, Fut>(&self, frame: &Frame, call: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Option<T>>>,
+    {
+        if let Some(value) = call().await? {
+            return Ok(value);
+        }
+        self.install_runtime(frame).await?;
+        call()
+            .await?
+            .context("the page runtime was gone again right after it was installed")
+    }
+
+    async fn install_runtime(&self, frame: &Frame) -> Result<()> {
+        match &self.inner.target {
+            PageTarget::Bidi(_) => {
+                self.bidi_call(frame, js::install_call(), &[], None)
+                    .await
+                    .context("install the page runtime")?;
+            }
+            PageTarget::Classic(_) => {
+                self.in_classic_frame(frame, || async {
+                    self.driver()
+                        .execute(js::classic_body(&js::install_call()), Vec::new())
+                        .await
+                        .context("install the page runtime")
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn bidi_call(
+        &self,
+        frame: &Frame,
+        function_declaration: String,
+        args: &[JsArg],
+        user_activation: Option<bool>,
+    ) -> Result<RemoteValue> {
+        let arguments = args
+            .iter()
+            .map(JsArg::to_local)
+            .collect::<Result<Vec<_>>>()?;
+        let result = self
+            .bidi_handle()?
+            .send(CallFunction {
+                function_declaration,
+                await_promise: true,
+                target: Target::Context {
+                    context: self.bidi_context(frame)?,
+                    sandbox: None,
+                },
+                arguments,
+                user_activation,
+            })
+            .await
+            .context("script.callFunction")?;
+        match result {
+            CallResult::Success { result } => Ok(result),
+            CallResult::Exception { exception_details } => bail!(
+                "page script threw at line {}: {}",
+                exception_details.line_number.unwrap_or(0),
+                exception_details.text
+            ),
         }
     }
 
-    /// Call `func(lib, ...args)` in the page runtime and return the elements it yields.
-    pub(crate) async fn call_elements(
-        &self,
-        func: &str,
-        args: Vec<JsArg>,
-    ) -> Result<Vec<ElementRef>> {
-        match &self.inner.target {
-            PageTarget::Bidi(context) => {
-                let arguments = args
-                    .iter()
-                    .map(JsArg::to_local)
-                    .collect::<Result<Vec<_>>>()?;
-                let result = self
-                    .bidi_handle()?
-                    .send(CallFunction {
-                        function_declaration: js::elements_call(func, ""),
-                        await_promise: true,
-                        target: Target::Context {
-                            context: context.clone(),
-                            sandbox: None,
-                        },
-                        arguments,
-                        user_activation: None,
+    /// Resolve `selector` in one frame of the page.
+    pub(crate) async fn resolve(&self, frame: &Frame, selector: &str) -> Result<Resolution> {
+        let args = vec![
+            JsArg::Str(selector.to_string()),
+            JsArg::Str(self.hooks().test_id_attribute().to_string()),
+            JsArg::Str(frame.prefix.clone()),
+        ];
+        let func = "(lib, selector, attr, prefix) => lib.resolve(selector, attr, prefix)";
+        let items = match &self.inner.target {
+            PageTarget::Bidi(_) => {
+                let declaration = js::array_call(func, "");
+                let value = self
+                    .with_runtime(frame, || async {
+                        match self
+                            .bidi_call(frame, declaration.clone(), &args, None)
+                            .await?
+                        {
+                            RemoteValue::Array { value } => Ok(Some(value)),
+                            RemoteValue::String { value } if value == js::RUNTIME_MISSING => {
+                                Ok(None)
+                            }
+                            other => bail!("expected a resolution array, got {other:?}"),
+                        }
                     })
-                    .await
-                    .context("script.callFunction")?;
-                match result {
-                    CallResult::Success {
-                        result: RemoteValue::Array { value },
-                    } => value
-                        .into_iter()
-                        .map(|item| match item {
-                            RemoteValue::Node {
-                                shared_id: Some(shared_id),
-                            } => Ok(ElementRef::Bidi(shared_id)),
-                            other => Err(anyhow!("expected an element, got {other:?}")),
-                        })
-                        .collect(),
-                    CallResult::Success { result } => {
-                        bail!("expected an element array, got {result:?}")
-                    }
-                    CallResult::Exception { exception_details } => bail!(
-                        "page script threw at line {}: {}",
-                        exception_details.line_number.unwrap_or(0),
-                        exception_details.text
-                    ),
-                }
+                    .await?;
+                value
+                    .into_iter()
+                    .map(|item| match item {
+                        RemoteValue::String { value } => Ok(Resolved::Text(value)),
+                        RemoteValue::Node {
+                            shared_id: Some(shared_id),
+                        } => Ok(Resolved::Element(ElementRef {
+                            frame: frame.clone(),
+                            handle: Handle::Bidi(shared_id),
+                        })),
+                        other => Err(anyhow!("unexpected {other:?} in a resolution")),
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
             PageTarget::Classic(_) => {
                 let arguments = args
                     .iter()
                     .map(JsArg::to_classic)
                     .collect::<Result<Vec<_>>>()?;
-                let window = self.classic_window().await?;
-                let prelude = self.classic_prelude();
+                let body = js::classic_body(&js::array_call(func, &self.classic_prelude(frame)));
                 let returned = self
-                    .driver()
-                    .execute(
-                        js::classic_body(&js::elements_call(func, &prelude)),
-                        arguments,
+                    .with_runtime(frame, || async {
+                        let returned = self
+                            .in_classic_frame(frame, || async {
+                                self.driver()
+                                    .execute(body.clone(), arguments.clone())
+                                    .await
+                                    .context("execute script")?
+                                    .convert::<serde_json::Value>()
+                                    .context("read the resolution")
+                            })
+                            .await?;
+                        match returned {
+                            serde_json::Value::Array(items) => Ok(Some(items)),
+                            serde_json::Value::String(text) if text == js::RUNTIME_MISSING => {
+                                Ok(None)
+                            }
+                            other => bail!("expected a resolution array, got {other}"),
+                        }
+                    })
+                    .await?;
+                returned
+                    .into_iter()
+                    .map(|item| match item {
+                        serde_json::Value::String(text) => Ok(Resolved::Text(text)),
+                        other => WebElement::from_json(other, Arc::clone(self.driver()))
+                            .map(|element| {
+                                Resolved::Element(ElementRef {
+                                    frame: frame.clone(),
+                                    handle: Handle::Classic(element),
+                                })
+                            })
+                            .context("read an element of the resolution"),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        Resolution::parse(items)
+    }
+
+    /// The frame showing the document of an `<iframe>` or `<frame>` element.
+    pub(crate) async fn content_frame(&self, element: &ElementRef) -> Result<Frame> {
+        let target = match &element.handle {
+            Handle::Bidi(_) => {
+                let result = self
+                    .bidi_call(
+                        &element.frame,
+                        "(el) => el.contentWindow".to_string(),
+                        &[JsArg::El(element.clone())],
+                        None,
                     )
                     .await
-                    .context("execute script")?;
-                drop(window);
-                Ok(returned
-                    .elements()
-                    .context("read the returned elements")?
-                    .into_iter()
-                    .map(ElementRef::Classic)
-                    .collect())
+                    .context("read the frame's window")?;
+                let RemoteValue::Window { value } = result else {
+                    bail!("expected the frame's window, got {result:?}");
+                };
+                FrameTarget::Bidi(value.context)
             }
+            Handle::Classic(iframe) => {
+                let mut path = match &element.frame.target {
+                    FrameTarget::Classic(path) => path.clone(),
+                    FrameTarget::Top => Vec::new(),
+                    FrameTarget::Bidi(_) => bail!("a Classic element in a BiDi frame"),
+                };
+                path.push(iframe.clone());
+                FrameTarget::Classic(path)
+            }
+        };
+        Ok(self.inner.frames.register(target, element.clone()))
+    }
+
+    /// Carry `point`, in `frame`'s viewport, up to the top-level viewport. At each frame
+    /// boundary the parent checks that its frame element receives the pointer there.
+    pub(crate) async fn lift(&self, frame: &Frame, point: Hit) -> Result<Hit> {
+        let mut lifted = point;
+        let mut current = frame.clone();
+        while let Some(host) = current.host.take() {
+            let outer: Hit = self
+                .call_on(
+                    &host,
+                    "(lib, el, x, y) => lib.frameHit(el, x, y)",
+                    vec![JsArg::Int(lifted.x), JsArg::Int(lifted.y)],
+                )
+                .await
+                .context("place the point in the parent frame")?;
+            lifted = Hit {
+                ok: lifted.ok && outer.ok,
+                // The innermost obstacle is the one to report.
+                reason: if lifted.ok {
+                    outer.reason
+                } else {
+                    lifted.reason
+                },
+                x: outer.x,
+                y: outer.y,
+                outside: lifted.outside || outer.outside,
+            };
+            current = host.frame;
         }
+        Ok(lifted)
     }
 
-    /// Classic has no preload scripts: every call first ensures the runtime, the
-    /// capture hooks and the init scripts are in the current document.
-    fn classic_prelude(&self) -> String {
-        let mut scripts = self.inner.context.init_scripts();
-        scripts.push("window.__onday.installCapture();".to_string());
-        format!("{}\n{}", js::runtime_guard(), js::init_prelude(&scripts))
+    /// Scroll each ancestor document until `(x, y)` in `frame`'s viewport is on screen.
+    pub(crate) async fn reveal(&self, frame: &Frame, x: i64, y: i64) -> Result<()> {
+        let (mut x, mut y) = (x, y);
+        let mut current = frame.clone();
+        while let Some(host) = current.host.take() {
+            let outer: Hit = self
+                .call_on(
+                    &host,
+                    "(lib, el, x, y) => lib.revealFrame(el, x, y)",
+                    vec![JsArg::Int(x), JsArg::Int(y)],
+                )
+                .await
+                .context("scroll the frame into view")?;
+            (x, y) = (outer.x, outer.y);
+            current = host.frame;
+        }
+        Ok(())
     }
 
-    // ── aria snapshot ──────────────────────────────────────────────────────
+    /// Where `frame`'s viewport starts in the top-level viewport.
+    async fn frame_origin(&self, frame: &Frame) -> Result<(f64, f64)> {
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut current = frame.clone();
+        while let Some(host) = current.host.take() {
+            let [dx, dy]: [f64; 2] = self
+                .call_on(&host, "(lib, el) => lib.frameOffset(el)", Vec::new())
+                .await
+                .context("measure the frame")?;
+            x += dx;
+            y += dy;
+            current = host.frame;
+        }
+        Ok((x, y))
+    }
 
-    /// An accessibility-tree snapshot with `[ref=…]` labels usable in `ref=` selectors.
-    pub async fn snapshot(&self) -> Result<String> {
-        self.call_json("(lib) => lib.snapshot(null, 5000)", Vec::new())
-            .await
-            .context("take an aria snapshot")
+    /// The frame whose refs carry `prefix`.
+    pub(crate) fn frame_by_prefix(&self, prefix: &str) -> Result<Frame> {
+        self.inner.frames.by_prefix(prefix)
+    }
+
+    /// Classic has no preload scripts: every call first runs the init scripts and, in a
+    /// top document that has the runtime, installs the capture hooks. Frames skip the
+    /// capture because they share the top document's sessionStorage buffers.
+    fn classic_prelude(&self, frame: &Frame) -> String {
+        let init = js::init_prelude(&self.inner.context.init_scripts());
+        if frame.target == FrameTarget::Top {
+            // Outside the once-per-document init block: a call that runs before the
+            // runtime is installed must not use up the document's only chance.
+            format!("{init}\nif (window.__onday) window.__onday.installCapture();")
+        } else {
+            init
+        }
     }
 
     // ── input ──────────────────────────────────────────────────────────────
 
     pub fn keyboard(&self) -> Keyboard<'_> {
-        Keyboard { page: self }
+        self.keyboard_in(Frame::top())
+    }
+
+    /// Keyboard input to one frame of the page.
+    pub(crate) fn keyboard_in(&self, frame: Frame) -> Keyboard<'_> {
+        Keyboard { page: self, frame }
     }
 
     pub fn mouse(&self) -> Mouse<'_> {
@@ -738,9 +1032,17 @@ impl Page {
         }
     }
 
-    pub(crate) async fn pointer(&self, actions: Vec<PointerAction>) -> Result<()> {
+    /// Pointer input to `frame`, in its viewport's coordinates. Input goes to the
+    /// frame itself because engines do not all route top-level input into
+    /// out-of-process frames.
+    pub(crate) async fn pointer(
+        &self,
+        frame: &Frame,
+        anchor: Option<Anchor<'_>>,
+        actions: Vec<PointerAction>,
+    ) -> Result<()> {
         match &self.inner.target {
-            PageTarget::Bidi(context) => {
+            PageTarget::Bidi(_) => {
                 let source = SourceActions::Pointer {
                     id: "onday-mouse".to_string(),
                     parameters: PointerParameters {
@@ -748,60 +1050,97 @@ impl Page {
                     },
                     actions,
                 };
-                self.perform(context, source, "pointer").await
+                self.perform(&self.bidi_context(frame)?, source, "pointer")
+                    .await
             }
             PageTarget::Classic(_) => {
-                let window = self.classic_window().await?;
-                let mut chain = self.driver().action_chain();
-                for action in actions {
-                    chain = match action {
-                        PointerAction::PointerMove { x, y, .. } => chain.move_to(x, y),
-                        PointerAction::PointerDown { button: 0 } => chain.click_and_hold(),
-                        PointerAction::PointerUp { button: 0 } => chain.release(),
-                        PointerAction::Pause { duration } => {
-                            chain.perform().await.context("perform pointer actions")?;
-                            tokio::time::sleep(Duration::from_millis(duration)).await;
-                            self.driver().action_chain()
-                        }
-                        PointerAction::PointerDown { button }
-                        | PointerAction::PointerUp { button } => {
-                            bail!("mouse button {button} needs a BiDi session")
-                        }
-                    };
-                }
-                chain.perform().await.context("perform pointer actions")?;
-                drop(window);
-                Ok(())
+                self.in_classic_frame(frame, || self.classic_pointer(anchor, actions))
+                    .await
             }
         }
     }
 
+    async fn classic_pointer(
+        &self,
+        anchor: Option<Anchor<'_>>,
+        actions: Vec<PointerAction>,
+    ) -> Result<()> {
+        let anchor = match anchor {
+            Some(Anchor {
+                element:
+                    ElementRef {
+                        handle: Handle::Classic(element),
+                        ..
+                    },
+                x,
+                y,
+            }) => Some((element, x, y)),
+            Some(_) => bail!("a BiDi element cannot anchor Classic input"),
+            None => None,
+        };
+        let mut chain = self.driver().action_chain();
+        for action in actions {
+            chain = match action {
+                PointerAction::PointerMove { x, y, .. } => match anchor {
+                    Some((element, ax, ay)) => {
+                        chain.move_to_element_with_offset(element, x - ax, y - ay)
+                    }
+                    None => chain.move_to(x, y),
+                },
+                PointerAction::PointerDown { button: 0 } => chain.click_and_hold(),
+                PointerAction::PointerUp { button: 0 } => chain.release(),
+                PointerAction::Pause { duration } => {
+                    chain.perform().await.context("perform pointer actions")?;
+                    tokio::time::sleep(Duration::from_millis(duration)).await;
+                    self.driver().action_chain()
+                }
+                PointerAction::PointerDown { button } | PointerAction::PointerUp { button } => {
+                    bail!("mouse button {button} needs a BiDi session")
+                }
+            };
+        }
+        chain.perform().await.context("perform pointer actions")
+    }
+
     pub(crate) async fn click_at(
         &self,
-        x: i64,
-        y: i64,
+        point: ClickPoint<'_>,
         button: MouseButton,
         count: u32,
         modifiers: &[String],
     ) -> Result<()> {
+        let ClickPoint {
+            frame,
+            anchor,
+            x,
+            y,
+        } = point;
         if let PageTarget::Classic(_) = &self.inner.target
             && button != MouseButton::Left
         {
             if button == MouseButton::Right && count == 1 && modifiers.is_empty() {
-                let window = self.classic_window().await?;
-                self.driver()
-                    .action_chain()
-                    .move_to(x, y)
-                    .context_click()
-                    .perform()
-                    .await
-                    .context("right-click")?;
-                drop(window);
-                return Ok(());
+                let actions = vec![PointerAction::PointerMove {
+                    x,
+                    y,
+                    duration: None,
+                    origin: "viewport",
+                }];
+                self.pointer(frame, anchor, actions).await?;
+                return self
+                    .in_classic_frame(frame, || async {
+                        self.driver()
+                            .action_chain()
+                            .context_click()
+                            .perform()
+                            .await
+                            .context("right-click")
+                    })
+                    .await;
             }
             bail!("{button:?}-button clicks need a BiDi session");
         }
         self.keys(
+            frame,
             modifiers
                 .iter()
                 .map(|key| KeyAction::KeyDown { value: key.clone() })
@@ -822,8 +1161,9 @@ impl Page {
                 button: button.code(),
             });
         }
-        let clicked = self.pointer(actions).await;
+        let clicked = self.pointer(frame, anchor, actions).await;
         self.keys(
+            frame,
             modifiers
                 .iter()
                 .rev()
@@ -834,30 +1174,32 @@ impl Page {
         clicked
     }
 
-    pub(crate) async fn keys(&self, actions: Vec<KeyAction>) -> Result<()> {
+    /// Key input to `frame`, which should hold the focused element.
+    pub(crate) async fn keys(&self, frame: &Frame, actions: Vec<KeyAction>) -> Result<()> {
         if actions.is_empty() {
             return Ok(());
         }
         match &self.inner.target {
-            PageTarget::Bidi(context) => {
+            PageTarget::Bidi(_) => {
                 let source = SourceActions::Key {
                     id: "onday-keyboard".to_string(),
                     actions,
                 };
-                self.perform(context, source, "keys").await
+                self.perform(&self.bidi_context(frame)?, source, "keys")
+                    .await
             }
             PageTarget::Classic(_) => {
-                let window = self.classic_window().await?;
-                let mut chain = self.driver().action_chain();
-                for action in actions {
-                    chain = match action {
-                        KeyAction::KeyDown { value } => chain.key_down(single_char(&value)?),
-                        KeyAction::KeyUp { value } => chain.key_up(single_char(&value)?),
-                    };
-                }
-                chain.perform().await.context("perform key actions")?;
-                drop(window);
-                Ok(())
+                self.in_classic_frame(frame, || async {
+                    let mut chain = self.driver().action_chain();
+                    for action in actions {
+                        chain = match action {
+                            KeyAction::KeyDown { value } => chain.key_down(single_char(&value)?),
+                            KeyAction::KeyUp { value } => chain.key_up(single_char(&value)?),
+                        };
+                    }
+                    chain.perform().await.context("perform key actions")
+                })
+                .await
             }
         }
     }
@@ -887,25 +1229,28 @@ impl Page {
     }
 
     pub(crate) async fn set_files(&self, element: &ElementRef, files: Vec<String>) -> Result<()> {
-        match (element, &self.inner.target) {
-            (ElementRef::Bidi(shared_id), PageTarget::Bidi(context)) => {
+        match &element.handle {
+            Handle::Bidi(shared_id) => {
                 self.bidi_handle()?
                     .input()
-                    .set_files(context.clone(), &NodeId::from(shared_id.clone()), files)
+                    .set_files(
+                        self.bidi_context(&element.frame)?,
+                        &NodeId::from(shared_id.clone()),
+                        files,
+                    )
                     .await
                     .context("input.setFiles")?;
                 Ok(())
             }
-            (ElementRef::Classic(element), PageTarget::Classic(_)) => {
-                let window = self.classic_window().await?;
-                element
-                    .send_keys(files.join("\n"))
-                    .await
-                    .context("send file paths to the input")?;
-                drop(window);
-                Ok(())
+            Handle::Classic(input) => {
+                self.in_classic_frame(&element.frame, || async {
+                    input
+                        .send_keys(files.join("\n"))
+                        .await
+                        .context("send file paths to the input")
+                })
+                .await
             }
-            _ => bail!("element handle does not belong to this page's protocol"),
         }
     }
 
@@ -944,33 +1289,60 @@ impl Page {
     }
 
     pub(crate) async fn element_screenshot(&self, element: &ElementRef) -> Result<Vec<u8>> {
-        match (element, &self.inner.target) {
-            (ElementRef::Bidi(shared_id), PageTarget::Bidi(context)) => {
-                let shot = self
-                    .bidi_handle()?
-                    .send(CaptureScreenshot {
-                        context: context.clone(),
-                        origin: "document",
-                        clip: Some(ScreenshotClip::Element {
+        match &element.handle {
+            Handle::Bidi(shared_id) => {
+                // Captures run on the top-level context, where a frame's node ids mean
+                // nothing; clip to the element's box instead.
+                let (origin, clip) = match &element.frame.target {
+                    FrameTarget::Top => (
+                        "document",
+                        ScreenshotClip::Element {
                             element: SharedRef {
                                 shared_id: shared_id.clone(),
                             },
-                        }),
+                        },
+                    ),
+                    _ => {
+                        let [x, y, width, height]: [f64; 4] = self
+                            .call_on(
+                                element,
+                                "(lib, el) => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }",
+                                Vec::new(),
+                            )
+                            .await
+                            .context("measure the element")?;
+                        let (dx, dy) = self.frame_origin(&element.frame).await?;
+                        (
+                            "viewport",
+                            ScreenshotClip::Box {
+                                x: x + dx,
+                                y: y + dy,
+                                width,
+                                height,
+                            },
+                        )
+                    }
+                };
+                let shot = self
+                    .bidi_handle()?
+                    .send(CaptureScreenshot {
+                        context: self.bidi_context(&Frame::top())?,
+                        origin,
+                        clip: Some(clip),
                     })
                     .await
                     .context("browsingContext.captureScreenshot (element)")?;
                 decode_png(&shot.data)
             }
-            (ElementRef::Classic(element), PageTarget::Classic(_)) => {
-                let window = self.classic_window().await?;
-                let png = element
-                    .screenshot_as_png()
-                    .await
-                    .context("screenshot the element")?;
-                drop(window);
-                Ok(png)
+            Handle::Classic(target) => {
+                self.in_classic_frame(&element.frame, || async {
+                    target
+                        .screenshot_as_png()
+                        .await
+                        .context("screenshot the element")
+                })
+                .await
             }
-            _ => bail!("element handle does not belong to this page's protocol"),
         }
     }
 
@@ -1162,7 +1534,7 @@ impl Page {
             return Ok(());
         }
         let drained: Drained = self
-            .call_json("(lib) => lib.drainCapture()", Vec::new())
+            .call_json(&Frame::top(), "(lib) => lib.drainCapture()", Vec::new())
             .await
             .context("drain the page's console and network capture")?;
         for message in drained.console {
@@ -1232,6 +1604,61 @@ impl Page {
             .context("this page's session has no BiDi connection")
     }
 
+    /// The BiDi browsing context holding `frame`'s document.
+    fn bidi_context(&self, frame: &Frame) -> Result<BrowsingContextId> {
+        match (&frame.target, &self.inner.target) {
+            (FrameTarget::Top, PageTarget::Bidi(context)) => Ok(context.clone()),
+            (FrameTarget::Bidi(context), PageTarget::Bidi(_)) => Ok(context.clone()),
+            _ => bail!("frame {:?} does not belong to a BiDi page", frame.prefix),
+        }
+    }
+
+    /// Run `op` with the Classic session switched into `frame`, then back to the top
+    /// document, which every other Classic command assumes.
+    async fn in_classic_frame<T, F, Fut>(&self, frame: &Frame, op: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let path = match &frame.target {
+            FrameTarget::Top => &[][..],
+            FrameTarget::Classic(path) => path.as_slice(),
+            FrameTarget::Bidi(_) => {
+                bail!("frame {} does not belong to a Classic page", frame.prefix)
+            }
+        };
+        let window = self.classic_window().await?;
+        let mut entered = Ok(());
+        for iframe in path {
+            if let Err(error) = iframe.clone().enter_frame().await {
+                entered = Err(error).with_context(|| format!("enter frame {}", frame.prefix));
+                break;
+            }
+        }
+        let result = match entered {
+            Ok(()) => op().await,
+            Err(error) => Err(error),
+        };
+        if !path.is_empty() {
+            let reset = self
+                .driver()
+                .enter_default_frame()
+                .await
+                .context("return to the top document");
+            if let Err(error) = reset {
+                return match result {
+                    Ok(_) => Err(error),
+                    Err(failure) => {
+                        tracing::warn!("{error:#}");
+                        Err(failure)
+                    }
+                };
+            }
+        }
+        drop(window);
+        result
+    }
+
     /// Switch the Classic session to this page's window; held for one command.
     pub(crate) async fn classic_window(
         &self,
@@ -1254,6 +1681,7 @@ impl Page {
 /// Keyboard input to the focused element.
 pub struct Keyboard<'a> {
     page: &'a Page,
+    frame: Frame,
 }
 
 impl Keyboard<'_> {
@@ -1271,7 +1699,7 @@ impl Keyboard<'_> {
         actions.extend(modifiers.iter().rev().map(|value| KeyAction::KeyUp {
             value: value.clone(),
         }));
-        self.page.keys(actions).await
+        self.page.keys(&self.frame, actions).await
     }
 
     /// Type text a character at a time.
@@ -1289,22 +1717,28 @@ impl Keyboard<'_> {
                 ]
             })
             .collect();
-        self.page.keys(actions).await
+        self.page.keys(&self.frame, actions).await
     }
 
     pub async fn down(&self, key: &str) -> Result<()> {
         self.page
-            .keys(vec![KeyAction::KeyDown {
-                value: key_value(key)?,
-            }])
+            .keys(
+                &self.frame,
+                vec![KeyAction::KeyDown {
+                    value: key_value(key)?,
+                }],
+            )
             .await
     }
 
     pub async fn up(&self, key: &str) -> Result<()> {
         self.page
-            .keys(vec![KeyAction::KeyUp {
-                value: key_value(key)?,
-            }])
+            .keys(
+                &self.frame,
+                vec![KeyAction::KeyUp {
+                    value: key_value(key)?,
+                }],
+            )
             .await
     }
 }
@@ -1316,23 +1750,60 @@ pub struct Mouse<'a> {
 
 impl Mouse<'_> {
     pub async fn click(&self, x: i64, y: i64, button: MouseButton) -> Result<()> {
-        self.page.click_at(x, y, button, 1, &[]).await
+        self.page
+            .click_at(
+                ClickPoint {
+                    frame: &Frame::top(),
+                    anchor: None,
+                    x,
+                    y,
+                },
+                button,
+                1,
+                &[],
+            )
+            .await
     }
 
     pub async fn move_to(&self, x: i64, y: i64) -> Result<()> {
         self.page
-            .pointer(vec![PointerAction::PointerMove {
-                x,
-                y,
-                duration: None,
-                origin: "viewport",
-            }])
+            .pointer(
+                &Frame::top(),
+                None,
+                vec![PointerAction::PointerMove {
+                    x,
+                    y,
+                    duration: None,
+                    origin: "viewport",
+                }],
+            )
             .await
     }
 
     pub async fn wheel(&self, delta_x: i64, delta_y: i64) -> Result<()> {
         self.page.wheel(0, 0, delta_x, delta_y).await
     }
+}
+
+/// `None` when a runtime call found its document without the runtime.
+fn present(text: String) -> Option<String> {
+    (text != js::RUNTIME_MISSING).then_some(text)
+}
+
+/// Element handles only mean something inside their own frame.
+fn check_frames(frame: &Frame, args: &[JsArg]) -> Result<()> {
+    for arg in args {
+        if let JsArg::El(element) = arg
+            && element.frame != *frame
+        {
+            bail!(
+                "an element of frame {:?} cannot be used in frame {:?}",
+                element.frame.prefix,
+                frame.prefix
+            );
+        }
+    }
+    Ok(())
 }
 
 fn single_char(value: &str) -> Result<char> {

@@ -10,7 +10,9 @@ pub const SCROLL_TO_TARGET_VIA_SCROLLBAR: &str = include_str!("js/scroll_to_targ
 const LIB_TEMPLATE: &str = include_str!("js/lib.js");
 
 struct Runtime {
+    /// Hash of the runtime source; pages running another version reinstall it.
     version: String,
+    /// Statement installing `window.__onday` unless this version is already present.
     guard: String,
 }
 
@@ -30,35 +32,45 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-/// Hash of the runtime source; pages running another version reinstall it.
-pub fn runtime_version() -> &'static str {
-    &runtime().version
+/// What a runtime call returns when its document lacks this runtime version. The
+/// caller installs it with [`install_call`] and calls again: the browser keeps every
+/// distinct script it compiles, so shipping the runtime with each call would make
+/// every later command slower.
+pub const RUNTIME_MISSING: &str = "__onday_runtime_missing__";
+
+/// Function declaration installing the runtime in the current document.
+pub fn install_call() -> String {
+    format!("function() {{\n{}\nreturn true;\n}}", runtime().guard)
 }
 
-/// Statement installing `window.__onday` unless this version is already present.
-pub fn runtime_guard() -> &'static str {
-    &runtime().guard
+fn runtime_check() -> String {
+    format!(
+        "if (!window.__onday || window.__onday.version !== '{}') return '{RUNTIME_MISSING}';",
+        runtime().version
+    )
 }
 
-/// Function declaration calling `func(lib, ...args)` and returning its result as JSON text.
+/// Function declaration calling `func(lib, ...args)` and returning its result as JSON
+/// text, or [`RUNTIME_MISSING`].
 pub fn json_call(func: &str, prelude: &str) -> String {
     format!(
-        "async function(...args) {{\n{guard}\n{prelude}\nconst __f = (\n{func}\n);\n\
+        "async function(...args) {{\n{check}\n{prelude}\nconst __f = (\n{func}\n);\n\
          const __r = await __f(window.__onday, ...args);\n\
          return __ondayJson(__r);\n\
          function __ondayJson(v) {{ try {{ return JSON.stringify(v === undefined ? null : v); }} \
          catch (e) {{ return JSON.stringify(String(v)); }} }}\n}}",
-        guard = runtime().guard,
+        check = runtime_check(),
     )
 }
 
-/// Function declaration calling `func(lib, ...args)` and returning an array of elements.
-pub fn elements_call(func: &str, prelude: &str) -> String {
+/// Function declaration calling `func(lib, ...args)` and returning its array as-is,
+/// so elements in it come back as live handles, or [`RUNTIME_MISSING`].
+pub fn array_call(func: &str, prelude: &str) -> String {
     format!(
-        "async function(...args) {{\n{guard}\n{prelude}\nconst __f = (\n{func}\n);\n\
+        "async function(...args) {{\n{check}\n{prelude}\nconst __f = (\n{func}\n);\n\
          const __r = await __f(window.__onday, ...args);\n\
          return Array.isArray(__r) ? __r : (__r ? [__r] : []);\n}}",
-        guard = runtime().guard,
+        check = runtime_check(),
     )
 }
 
@@ -143,6 +155,17 @@ pub fn js_single_quoted(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_calls_stay_small() {
+        let call = json_call("(lib) => lib.snapshot(null, 10, '')", "");
+        assert!(call.contains(RUNTIME_MISSING));
+        assert!(
+            call.len() < 1024,
+            "the runtime leaked into a call: {} bytes",
+            call.len()
+        );
+    }
 
     #[test]
     fn runtime_substitutes_every_placeholder() {

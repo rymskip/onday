@@ -21,12 +21,13 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::params::*;
-use crate::session::SessionDir;
+use crate::session::{Session, SessionDir};
 
 const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, WebDriver Classic fallback).
-- This server process is one session with its own browser, profile and logs under the session directory (see browser_status). Other sessions in the same directory are independent.
+- This server process is one session with its own browser, profile and logs under the session directory (see browser_status), created by the first browser tool. Other sessions in the same directory are independent.
 - browser_launch switches engine (chromium, firefox, webkit) at any time; other tools launch the default engine on first use.
 - Target elements with a ref from browser_snapshot (e.g. \"e12\") or a selector: CSS, text=…, role=button[name=\"Save\"], testid=…, label=…, chained with >>.
+- Iframes, same- or cross-origin, appear in the snapshot under their iframe entry, with refs like \"f1e3\". A selector enters a frame when a >> step follows one: iframe[title=\"Editor\"] >> testid=save. Without that step a selector only searches the top document.
 - Actions auto-wait for the element to be visible, stable, enabled and unobscured, then use real pointer and key input.
 - Mutating tools answer with the page URL, any open dialog (\"Modal state\"), new console messages and a fresh snapshot.
 - Console and network logs stream into the session's logs/ directory.";
@@ -44,7 +45,7 @@ struct Running {
 #[derive(Clone)]
 pub struct OndayServer {
     config: Arc<Config>,
-    dir: Arc<SessionDir>,
+    session: Arc<Session>,
     state: Arc<Mutex<Option<Running>>>,
 }
 
@@ -62,10 +63,10 @@ fn reply(outcome: Result<String>) -> Result<CallToolResult, McpError> {
 }
 
 impl OndayServer {
-    pub fn new(config: Config, dir: SessionDir) -> Self {
+    pub fn new(config: Config, session: Session) -> Self {
         OndayServer {
             config: Arc::new(config),
-            dir: Arc::new(dir),
+            session: Arc::new(session),
             state: Arc::new(Mutex::new(None)),
         }
     }
@@ -88,10 +89,11 @@ impl OndayServer {
         executable: Option<std::path::PathBuf>,
         classic: bool,
     ) -> Result<Running> {
+        let dir = self.session.dir().await?;
         let mut options = LaunchOptions::new(engine)
             .headless(headless)
             .window_size(viewport.0, viewport.1)
-            .driver_log(self.dir.driver_log())
+            .driver_log(dir.driver_log())
             .protocol(if classic {
                 ProtocolPreference::Classic
             } else {
@@ -109,7 +111,7 @@ impl OndayServer {
             (None, None) => DriverSource::Managed,
         };
         if !self.config.isolated {
-            let profile = self.dir.profile(engine);
+            let profile = dir.profile(engine);
             std::fs::create_dir_all(&profile)
                 .with_context(|| format!("create {}", profile.display()))?;
             options = options.user_data_dir(profile);
@@ -119,14 +121,13 @@ impl OndayServer {
             .default_context(ContextOptions {
                 viewport: Some(viewport),
                 dialog_policy: DialogPolicy::Leave,
-                downloads_dir: Some(self.dir.downloads()),
+                downloads_dir: Some(dir.downloads()),
                 ..ContextOptions::default()
             })
             .await?;
         let page = context.page().await?;
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
-        self.dir
-            .write_metadata(Some(engine), Some(browser.protocol().to_string()))?;
+        dir.write_metadata(Some(engine), Some(browser.protocol().to_string()))?;
         tracing::info!("launched {engine} over {}", browser.protocol());
         let mut running = Running {
             browser,
@@ -137,12 +138,12 @@ impl OndayServer {
             streamed: HashSet::new(),
             headless,
         };
-        self.stream_logs(&mut running, &page);
+        Self::stream_logs(&dir, &mut running, &page);
         Ok(running)
     }
 
     /// Write a BiDi page's console and network events to the session logs as they happen.
-    fn stream_logs(&self, running: &mut Running, page: &Page) {
+    fn stream_logs(dir: &Arc<SessionDir>, running: &mut Running, page: &Page) {
         let Some(id) = page.context_id() else {
             return;
         };
@@ -150,14 +151,14 @@ impl OndayServer {
             return;
         }
         let mut console = page.on_console();
-        let dir = self.dir.clone();
+        let console_dir = dir.clone();
         tokio::spawn(async move {
             while let Ok(message) = console.recv().await {
-                dir.log_console(&message);
+                console_dir.log_console(&message);
             }
         });
         let mut network = page.on_network();
-        let dir = self.dir.clone();
+        let dir = dir.clone();
         tokio::spawn(async move {
             while let Ok(entry) = network.recv().await {
                 dir.log_network(&entry);
@@ -172,7 +173,7 @@ impl OndayServer {
             let running = self
                 .launch(
                     self.config.engine,
-                    !self.config.headed,
+                    self.config.headless,
                     self.config.viewport,
                     None,
                     self.config.classic,
@@ -181,12 +182,13 @@ impl OndayServer {
             *state = Some(running);
         }
         let running = state.as_mut().context("no browser")?;
+        let dir = self.session.dir().await?;
         let pages = running.context.pages().await?;
         if pages.is_empty() {
             let page = running.context.new_page().await?;
             page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
             running.current = 0;
-            self.stream_logs(running, &page);
+            Self::stream_logs(&dir, running, &page);
             return Ok(page);
         }
         if running.current >= pages.len() {
@@ -194,7 +196,7 @@ impl OndayServer {
         }
         let page = pages[running.current].clone();
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
-        self.stream_logs(running, &page);
+        Self::stream_logs(&dir, running, &page);
         Ok(page)
     }
 
@@ -243,7 +245,8 @@ impl OndayServer {
         }
         if snapshot && dialog.is_none() {
             let tree = self.snapshot_with_retry(page).await?;
-            std::fs::write(self.dir.snapshots().join("latest.yml"), &tree)
+            let dir = self.session.dir().await?;
+            std::fs::write(dir.snapshots().join("latest.yml"), &tree)
                 .context("save the snapshot")?;
             write!(out, "\n### Snapshot\n```yaml\n{tree}\n```\n").context("format")?;
         }
@@ -261,15 +264,16 @@ impl OndayServer {
             running.console_seen = last.seq;
         }
         if page.protocol() == Protocol::Classic {
+            let dir = self.session.dir().await?;
             for message in &fresh {
-                self.dir.log_console(message);
+                dir.log_console(message);
             }
             let requests = page.network_requests(running.network_seen).await?;
             if let Some(last) = requests.last() {
                 running.network_seen = last.seq;
             }
             for entry in &requests {
-                self.dir.log_network(entry);
+                dir.log_network(entry);
             }
         }
         Ok(fresh)
@@ -333,7 +337,7 @@ impl OndayServer {
             let headless = p
                 .headless
                 .or(previous_headless)
-                .unwrap_or(!self.config.headed);
+                .unwrap_or(self.config.headless);
             let viewport = (
                 p.width.unwrap_or(self.config.viewport.0),
                 p.height.unwrap_or(self.config.viewport.1),
@@ -368,14 +372,18 @@ impl OndayServer {
     )]
     async fn browser_status(&self) -> Result<CallToolResult, McpError> {
         let outcome = async {
-            let mut out = format!(
-                "Session: {}\nDirectory: {}\nLogs: {}/logs/{{console,network,driver,mcp}}.log\nScreenshots: {}\nLock holder pid: {}\n",
-                self.dir.id,
-                self.dir.root.display(),
-                self.dir.root.display(),
-                self.dir.screenshots().display(),
-                self.dir.holder()?.trim()
-            );
+            let root = self.session.root.display();
+            let mut out = format!("Session: {}\nDirectory: {root}\n", self.session.id);
+            match self.session.opened() {
+                Some(dir) => writeln!(
+                    out,
+                    "Logs: {root}/logs/{{console,network,driver,mcp}}.log\nScreenshots: {}\nLock holder pid: {}",
+                    dir.screenshots().display(),
+                    dir.holder()?.trim()
+                )
+                .context("format")?,
+                None => out.push_str("Directory not created yet: the first browser tool creates it\n"),
+            }
             let state = self.state.lock().await;
             match state.as_ref() {
                 None => out.push_str("Browser: not running (the next browser tool launches it)\n"),
@@ -624,7 +632,7 @@ impl OndayServer {
 
     #[tool(
         name = "browser_drag",
-        description = "Drag one element onto another with real pointer moves."
+        description = "Drag one element onto another with real pointer moves. HTML5 drag-and-drop the driver cannot complete, including drops into another frame, fires the drag events in the pages instead."
     )]
     async fn browser_drag(
         &self,
@@ -782,7 +790,7 @@ impl OndayServer {
                 Some(name) => sanitize_filename(&name)?,
                 None => format!("{}.png", timestamp_millis()),
             };
-            let path = self.dir.screenshots().join(name);
+            let path = self.session.dir().await?.screenshots().join(name);
             std::fs::write(&path, &png).with_context(|| format!("save {}", path.display()))?;
             Ok((path, png))
         }

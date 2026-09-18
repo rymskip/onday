@@ -30,7 +30,9 @@ pub mod route;
 pub mod warm;
 pub mod webauthn;
 
+mod frame;
 mod proto;
+mod snapshot;
 
 pub use browser::Browser;
 pub use context::{BrowserContext, ContextOptions};
