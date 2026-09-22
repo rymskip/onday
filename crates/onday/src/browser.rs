@@ -7,23 +7,27 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use thirtyfour::bidi::BiDi;
+use thirtyfour::bidi::modules::browser::CreateUserContext;
 use thirtyfour::manager::{BrowserKind, WebDriverManager};
 use thirtyfour::{Capabilities, WebDriver, WindowHandle};
 use tokio::process::Child;
 
+use crate::channel::{BidiChannel, Health, Liveness};
 use crate::context::{BrowserContext, ContextOptions};
 use crate::engine::Engine;
 use crate::events::EventHub;
 use crate::launch::{DriverSource, LaunchOptions, Protocol, ProtocolPreference};
+use crate::page::DEFAULT_TIMEOUT;
 use crate::poll::{Backoff, poll_until};
 
 /// One WebDriver session and, when negotiated, its BiDi connection.
 pub(crate) struct Session {
     pub(crate) driver: WebDriver,
-    pub(crate) bidi: Option<BiDi>,
+    pub(crate) bidi: Option<BidiChannel>,
     pub(crate) hub: Option<Arc<EventHub>>,
+    liveness: Arc<Liveness>,
     /// The Classic window commands currently target; held for a page operation.
     pub(crate) classic_window: tokio::sync::Mutex<Option<WindowHandle>>,
     endpoint: Endpoint,
@@ -47,6 +51,7 @@ impl Session {
                 .await
                 .with_context(|| format!("start a session at {}", process.url))?,
         };
+        let liveness = Liveness::new(driver.clone());
         let offered = driver
             .handle()
             .capabilities()
@@ -54,7 +59,7 @@ impl Session {
             .is_some_and(|url| url.is_string());
         let bidi = if preference == ProtocolPreference::Auto && offered {
             match driver.bidi().await {
-                Ok(bidi) => Some(bidi),
+                Ok(bidi) => Some(BidiChannel::new(bidi, liveness.clone())),
                 Err(error) => {
                     tracing::warn!(
                         "the driver offered BiDi but the connection failed; using Classic: {error}"
@@ -81,6 +86,7 @@ impl Session {
             driver,
             bidi,
             hub,
+            liveness,
             classic_window: tokio::sync::Mutex::new(Some(window)),
             endpoint,
         })
@@ -94,14 +100,24 @@ impl Session {
         }
     }
 
-    /// End the session, then stop a driver process onday spawned for it.
+    /// End the session, then stop a driver process onday spawned for it. A browser
+    /// that is already gone only has its driver released.
     pub(crate) async fn quit(&self) -> Result<()> {
-        let quit = self
-            .driver
-            .clone()
-            .quit()
-            .await
-            .context("end the WebDriver session");
+        let quit = match self.liveness.gone() {
+            Some(reason) => self.release(&reason),
+            None => match self.end_session().await {
+                Ok(()) => Ok(()),
+                Err(error) => match self.liveness.probe().await {
+                    Health::Gone(reason) => {
+                        tracing::warn!(
+                            "ending the session of a vanished browser failed: {error:#}"
+                        );
+                        self.release(&reason)
+                    }
+                    Health::Alive | Health::Unresponsive => Err(error),
+                },
+            },
+        };
         if let Endpoint::Spawned(process) = &self.endpoint {
             let child = process
                 .child
@@ -114,6 +130,26 @@ impl Session {
             }
         }
         quit
+    }
+
+    async fn end_session(&self) -> Result<()> {
+        tracing::debug!("ending the WebDriver session");
+        match tokio::time::timeout(DEFAULT_TIMEOUT, self.driver.clone().quit()).await {
+            Ok(ended) => ended.context("end the WebDriver session"),
+            Err(_) => Err(anyhow!(
+                "the driver did not end the session within {DEFAULT_TIMEOUT:?}"
+            )),
+        }
+    }
+
+    /// Give up a session whose browser is gone without asking the driver to end it.
+    /// The driver process stops once the last handle to the session drops.
+    fn release(&self, reason: &str) -> Result<()> {
+        tracing::info!("releasing the session of a vanished browser: {reason}");
+        self.driver
+            .clone()
+            .leak()
+            .context("release the vanished browser's session")
     }
 }
 
@@ -204,7 +240,19 @@ impl Browser {
 
     /// The BiDi connection of the first session, when negotiated.
     pub fn bidi(&self) -> Option<&BiDi> {
-        self.inner.primary.bidi.as_ref()
+        self.inner.primary.bidi.as_ref().map(BidiChannel::raw)
+    }
+
+    /// Whether the browser still answers, probed over WebDriver Classic within
+    /// [`PROBE_TIMEOUT`](crate::channel::PROBE_TIMEOUT).
+    pub async fn health(&self) -> Health {
+        self.inner.primary.liveness.probe().await
+    }
+
+    /// Why the browser is gone, if a command or probe already found out. Never
+    /// contacts the browser.
+    pub fn gone(&self) -> Option<String> {
+        self.inner.primary.liveness.gone()
     }
 
     /// The context the browser started with (its default profile).
@@ -223,12 +271,7 @@ impl Browser {
     pub async fn new_context(&self, options: ContextOptions) -> Result<BrowserContext> {
         match &self.inner.primary.bidi {
             Some(bidi) => {
-                let user_context = bidi
-                    .browser()
-                    .create_user_context()
-                    .await
-                    .context("browser.createUserContext")?
-                    .user_context;
+                let user_context = bidi.send(CreateUserContext::default()).await?.user_context;
                 BrowserContext::open(
                     self.inner.clone(),
                     self.inner.primary.clone(),
@@ -271,7 +314,8 @@ async fn endpoint_for(options: &LaunchOptions) -> Result<Endpoint> {
             ));
         }
     };
-    let mut builder = WebDriverManager::builder();
+    let mut builder = WebDriverManager::builder()
+        .on_status(|status| tracing::debug!("driver manager: {status:?}"));
     if let DriverSource::Binary(path) = &options.driver {
         builder = builder.driver_binary(kind, path.clone());
     }

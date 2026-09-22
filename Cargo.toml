@@ -3,14 +3,14 @@ resolver = "3"
 members = ["crates/onday", "crates/onday_mcp"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://gitlab.com/rymskip/onday"
 
 [workspace.dependencies]
-onday = { path = "crates/onday", version = "0.2.0" }
+onday = { path = "crates/onday", version = "0.2.1" }
 anyhow = "1.0"
 base64 = "0.23.1"
 clap = { version = "4", features = ["derive", "env"] }

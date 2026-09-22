@@ -194,6 +194,18 @@ pub enum WheelAction {
     },
 }
 
+#[derive(Debug, Serialize)]
+pub struct SetFiles {
+    pub context: BrowsingContextId,
+    pub element: SharedRef,
+    pub files: Vec<String>,
+}
+
+impl BidiCommand for SetFiles {
+    const METHOD: &'static str = "input.setFiles";
+    type Returns = Empty;
+}
+
 // ── browsingContext ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

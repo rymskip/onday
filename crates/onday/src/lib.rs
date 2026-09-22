@@ -14,6 +14,7 @@
 //! ```
 
 pub mod browser;
+pub mod channel;
 pub mod context;
 pub mod dom;
 pub mod engine;
@@ -35,6 +36,7 @@ mod proto;
 mod snapshot;
 
 pub use browser::Browser;
+pub use channel::{BrowserGone, Health};
 pub use context::{BrowserContext, ContextOptions};
 pub use dom::{WebDriverExt, escape_attr, testid_selector};
 pub use engine::Engine;

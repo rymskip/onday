@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use onday::{
     Browser, BrowserContext, ClickOptions, ContextOptions, DialogPolicy, DriverSource,
-    ElementState, Engine, Fulfill, InterceptedRequest, LaunchOptions, Locator, MouseButton, Page,
-    Protocol, ProtocolPreference, RouteAction, ScreenshotOptions, WaitUntil,
+    ElementState, Engine, Fulfill, Health, InterceptedRequest, LaunchOptions, Locator, MouseButton,
+    Page, Protocol, ProtocolPreference, RouteAction, ScreenshotOptions, WaitUntil,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, tool,
@@ -30,7 +31,8 @@ const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, We
 - Iframes, same- or cross-origin, appear in the snapshot under their iframe entry, with refs like \"f1e3\". A selector enters a frame when a >> step follows one: iframe[title=\"Editor\"] >> testid=save. Without that step a selector only searches the top document.
 - Actions auto-wait for the element to be visible, stable, enabled and unobscured, then use real pointer and key input.
 - Mutating tools answer with the page URL, any open dialog (\"Modal state\"), new console messages and a fresh snapshot.
-- Console and network logs stream into the session's logs/ directory.";
+- Console and network logs stream into the session's logs/ directory.
+- If the browser closes or crashes outside onday, the next tool fails fast and releases it. The session, its directory and profile stay; retrying the tool launches a new browser with the same settings. browser_status reports the browser's health.";
 
 struct Running {
     browser: Browser,
@@ -39,40 +41,117 @@ struct Running {
     console_seen: u64,
     network_seen: u64,
     streamed: HashSet<String>,
+}
+
+/// How the browser launches. Kept across relaunches, so a browser that closed
+/// comes back the way browser_launch last set it up.
+#[derive(Clone)]
+struct LaunchSettings {
+    engine: Engine,
     headless: bool,
+    viewport: (u32, u32),
+    /// Overrides the configured binary for `engine`.
+    executable: Option<PathBuf>,
+    classic: bool,
+}
+
+impl std::fmt::Display for LaunchSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}, {}x{}{})",
+            self.engine,
+            if self.headless { "headless" } else { "headed" },
+            self.viewport.0,
+            self.viewport.1,
+            if self.classic { ", Classic" } else { "" }
+        )
+    }
+}
+
+struct BrowserState {
+    running: Option<Running>,
+    settings: LaunchSettings,
+    /// Why the last browser was released, when it closed outside onday.
+    vanished: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct OndayServer {
     config: Arc<Config>,
     session: Arc<Session>,
-    state: Arc<Mutex<Option<Running>>>,
-}
-
-fn failure(error: anyhow::Error) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-        "{error:#}"
-    ))]))
-}
-
-fn reply(outcome: Result<String>) -> Result<CallToolResult, McpError> {
-    match outcome {
-        Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
-        Err(error) => failure(error),
-    }
+    state: Arc<Mutex<BrowserState>>,
 }
 
 impl OndayServer {
+    async fn reply(&self, outcome: Result<String>) -> Result<CallToolResult, McpError> {
+        match outcome {
+            Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
+            Err(error) => self.failure(error).await,
+        }
+    }
+
+    /// Report a failed tool call. A browser that closed outside onday is released,
+    /// and the agent is told what survives and how to carry on.
+    async fn failure(&self, error: anyhow::Error) -> Result<CallToolResult, McpError> {
+        let text = match self.release_if_gone().await {
+            None => format!("{error:#}"),
+            Some(settings) => {
+                let kept = if self.config.isolated {
+                    "keeps its directory and logs (its profile is throwaway, so cookies and logins do not carry over)"
+                } else {
+                    "keeps its directory, logs and browser profile, so cookies and logins carry over"
+                };
+                format!(
+                    "The browser was closed outside onday (its window was closed or it crashed), so this call did not run.\n\
+                     The onday session {id} is still running and {kept}. Retry the call to open a new {settings} browser.\n\
+                     Tabs, page state, snapshot refs and routes from the closed browser are gone: take a fresh browser_snapshot before using refs.\n\
+                     Detail: {error:#}",
+                    id = self.session.id,
+                )
+            }
+        };
+        Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+    }
+
+    /// Drop the running browser if it closed or crashed, reaping its driver, and
+    /// answer the settings its replacement launches with.
+    async fn release_if_gone(&self) -> Option<LaunchSettings> {
+        let mut state = self.state.lock().await;
+        let Health::Gone(reason) = state.running.as_ref()?.browser.health().await else {
+            return None;
+        };
+        tracing::warn!("releasing the vanished browser: {reason}");
+        if let Some(running) = state.running.take()
+            && let Err(error) = running.browser.close().await
+        {
+            tracing::warn!("releasing the vanished browser failed: {error:#}");
+        }
+        state.vanished = Some(reason);
+        Some(state.settings.clone())
+    }
+
     pub fn new(config: Config, session: Session) -> Self {
+        let settings = LaunchSettings {
+            engine: config.engine,
+            headless: config.headless,
+            viewport: config.viewport,
+            executable: None,
+            classic: config.classic,
+        };
         OndayServer {
             config: Arc::new(config),
             session: Arc::new(session),
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(BrowserState {
+                running: None,
+                settings,
+                vanished: None,
+            })),
         }
     }
 
     pub async fn shutdown(&self) {
-        if let Some(running) = self.state.lock().await.take()
+        if let Some(running) = self.state.lock().await.running.take()
             && let Err(error) = running.browser.close().await
         {
             tracing::warn!("closing the browser on shutdown failed: {error:#}");
@@ -81,20 +160,14 @@ impl OndayServer {
 
     // ── session plumbing ───────────────────────────────────────────────────
 
-    async fn launch(
-        &self,
-        engine: Engine,
-        headless: bool,
-        viewport: (u32, u32),
-        executable: Option<std::path::PathBuf>,
-        classic: bool,
-    ) -> Result<Running> {
+    async fn launch(&self, settings: &LaunchSettings) -> Result<Running> {
+        let engine = settings.engine;
         let dir = self.session.dir().await?;
         let mut options = LaunchOptions::new(engine)
-            .headless(headless)
-            .window_size(viewport.0, viewport.1)
+            .headless(settings.headless)
+            .window_size(settings.viewport.0, settings.viewport.1)
             .driver_log(dir.driver_log())
-            .protocol(if classic {
+            .protocol(if settings.classic {
                 ProtocolPreference::Classic
             } else {
                 ProtocolPreference::Auto
@@ -102,7 +175,11 @@ impl OndayServer {
         if self.config.no_sandbox {
             options = options.no_sandbox();
         }
-        if let Some(executable) = executable.or_else(|| self.config.executable(engine)) {
+        if let Some(executable) = settings
+            .executable
+            .clone()
+            .or_else(|| self.config.executable(engine))
+        {
             options = options.executable(executable);
         }
         options.driver = match (&self.config.webdriver_url, self.config.driver(engine)) {
@@ -119,7 +196,7 @@ impl OndayServer {
         let browser = Browser::launch(options).await?;
         let context = browser
             .default_context(ContextOptions {
-                viewport: Some(viewport),
+                viewport: Some(settings.viewport),
                 dialog_policy: DialogPolicy::Leave,
                 downloads_dir: Some(dir.downloads()),
                 ..ContextOptions::default()
@@ -128,7 +205,7 @@ impl OndayServer {
         let page = context.page().await?;
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
         dir.write_metadata(Some(engine), Some(browser.protocol().to_string()))?;
-        tracing::info!("launched {engine} over {}", browser.protocol());
+        tracing::info!("launched {settings} over {}", browser.protocol());
         let mut running = Running {
             browser,
             context,
@@ -136,7 +213,6 @@ impl OndayServer {
             console_seen: 0,
             network_seen: 0,
             streamed: HashSet::new(),
-            headless,
         };
         Self::stream_logs(&dir, &mut running, &page);
         Ok(running)
@@ -166,22 +242,15 @@ impl OndayServer {
         });
     }
 
-    /// The current page, launching the default engine first if needed.
+    /// The current page, launching the browser first if none is running.
     async fn page(&self) -> Result<Page> {
         let mut state = self.state.lock().await;
-        if state.is_none() {
-            let running = self
-                .launch(
-                    self.config.engine,
-                    self.config.headless,
-                    self.config.viewport,
-                    None,
-                    self.config.classic,
-                )
-                .await?;
-            *state = Some(running);
+        if state.running.is_none() {
+            let running = self.launch(&state.settings).await?;
+            state.running = Some(running);
+            state.vanished = None;
         }
-        let running = state.as_mut().context("no browser")?;
+        let running = state.running.as_mut().context("no browser")?;
         let dir = self.session.dir().await?;
         let pages = running.context.pages().await?;
         if pages.is_empty() {
@@ -256,7 +325,7 @@ impl OndayServer {
     /// Console messages the agent has not seen yet; Classic pages log them here too.
     async fn fresh_console(&self, page: &Page) -> Result<Vec<onday::ConsoleMessage>> {
         let mut state = self.state.lock().await;
-        let Some(running) = state.as_mut() else {
+        let Some(running) = state.running.as_mut() else {
             return Ok(Vec::new());
         };
         let fresh = page.console_messages(running.console_seen).await?;
@@ -320,55 +389,48 @@ impl OndayServer {
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let mut state = self.state.lock().await;
-            let previous_headless = state.as_ref().map(|running| running.headless);
-            if let Some(running) = state.take() {
+            if let Some(running) = state.running.take() {
                 running
                     .browser
                     .close()
                     .await
                     .context("close the running browser")?;
             }
+            let current = state.settings.clone();
             let engine = match p.engine {
                 Some(EngineParam::Chromium) => Engine::Chromium,
                 Some(EngineParam::Firefox) => Engine::Firefox,
                 Some(EngineParam::Webkit) => Engine::Webkit,
-                None => self.config.engine,
+                None => current.engine,
             };
-            let headless = p
-                .headless
-                .or(previous_headless)
-                .unwrap_or(self.config.headless);
-            let viewport = (
-                p.width.unwrap_or(self.config.viewport.0),
-                p.height.unwrap_or(self.config.viewport.1),
-            );
-            let classic = p.classic.unwrap_or(self.config.classic);
-            let running = self
-                .launch(
-                    engine,
-                    headless,
-                    viewport,
-                    p.executable_path.map(Into::into),
-                    classic,
-                )
-                .await?;
-            let summary = format!(
-                "Launched {engine} over {} ({}, {}x{})",
-                running.browser.protocol(),
-                if headless { "headless" } else { "headed" },
-                viewport.0,
-                viewport.1
-            );
-            *state = Some(running);
+            let settings = LaunchSettings {
+                engine,
+                headless: p.headless.unwrap_or(current.headless),
+                viewport: (
+                    p.width.unwrap_or(current.viewport.0),
+                    p.height.unwrap_or(current.viewport.1),
+                ),
+                executable: match p.executable_path {
+                    Some(path) => Some(path.into()),
+                    None if engine == current.engine => current.executable,
+                    None => None,
+                },
+                classic: p.classic.unwrap_or(current.classic),
+            };
+            let running = self.launch(&settings).await?;
+            let summary = format!("Launched {settings} over {}", running.browser.protocol());
+            state.settings = settings;
+            state.vanished = None;
+            state.running = Some(running);
             Ok(summary)
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
         name = "browser_status",
-        description = "Session id and directory, engine, protocol, tabs, routes and log paths."
+        description = "Session id and directory, engine, protocol, browser health, tabs, routes and log paths. Never waits on the browser."
     )]
     async fn browser_status(&self) -> Result<CallToolResult, McpError> {
         let outcome = async {
@@ -384,18 +446,35 @@ impl OndayServer {
                 .context("format")?,
                 None => out.push_str("Directory not created yet: the first browser tool creates it\n"),
             }
-            let state = self.state.lock().await;
-            match state.as_ref() {
-                None => out.push_str("Browser: not running (the next browser tool launches it)\n"),
-                Some(running) => {
+            let Ok(state) = self.state.try_lock() else {
+                out.push_str("Browser: busy (another tool call is using it)\n");
+                return Ok(out);
+            };
+            match (&state.running, &state.vanished) {
+                (None, None) => writeln!(
+                    out,
+                    "Browser: not running (the next browser tool launches {})",
+                    state.settings
+                )
+                .context("format")?,
+                (None, Some(reason)) => writeln!(
+                    out,
+                    "Browser: not running; the last one was closed outside onday ({reason}). The session is unaffected: the next browser tool launches a new {}",
+                    state.settings
+                )
+                .context("format")?,
+                (Some(running), _) => {
+                    let health = running.browser.health().await;
                     writeln!(
                         out,
-                        "Browser: {} over {} ({})",
-                        running.browser.engine(),
-                        running.browser.protocol(),
-                        if running.headless { "headless" } else { "headed" }
+                        "Browser: {} over {}\nHealth: {health}",
+                        state.settings,
+                        running.browser.protocol()
                     )
                     .context("format")?;
+                    if health != Health::Alive {
+                        return Ok(out);
+                    }
                     let pages = running.context.pages().await?;
                     for (index, page) in pages.iter().enumerate() {
                         let marker = if index == running.current { "*" } else { " " };
@@ -410,7 +489,7 @@ impl OndayServer {
             Ok(out)
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -421,13 +500,14 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<NavigateParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.goto(&p.url, WaitUntil::Load).await?;
                 Ok(String::new())
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -435,13 +515,14 @@ impl OndayServer {
         description = "Go back in the current tab's history."
     )]
     async fn browser_navigate_back(&self) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.go_back().await?;
                 Ok(String::new())
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -449,24 +530,26 @@ impl OndayServer {
         description = "Go forward in the current tab's history."
     )]
     async fn browser_navigate_forward(&self) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.go_forward().await?;
                 Ok(String::new())
             })
             .await,
         )
+        .await
     }
 
     #[tool(name = "browser_reload", description = "Reload the current tab.")]
     async fn browser_reload(&self) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.reload().await?;
                 Ok(String::new())
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -488,7 +571,7 @@ impl OndayServer {
             }
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -499,7 +582,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<ClickParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let locator = Self::locate(&page, &p.target)?;
                 locator
@@ -518,6 +601,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -528,13 +612,14 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<TargetOnlyParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 Self::locate(&page, &p.target)?.hover().await?;
                 Ok(format!("Hovered {}", describe(&p.target)))
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -545,7 +630,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<TypeParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let locator = Self::locate(&page, &p.target)?;
                 if p.slowly {
@@ -560,6 +645,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -570,7 +656,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<FillFormParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 for field in &p.fields {
                     let locator = Self::locate(&page, &field.target)?;
@@ -591,6 +677,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -601,7 +688,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<SelectParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let values: Vec<&str> = p.values.iter().map(String::as_str).collect();
                 let chosen = Self::locate(&page, &p.target)?
@@ -611,6 +698,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -621,13 +709,14 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<PressKeyParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.keyboard().press(&p.key).await?;
                 Ok(format!("Pressed {}", p.key))
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -638,7 +727,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<DragParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let start = Self::locate(
                     &page,
@@ -665,6 +754,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -675,7 +765,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<UploadParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let locator = match (&p.target.reference, &p.target.selector) {
                     (None, None) => page.locator("input[type=file]"),
@@ -686,6 +776,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -696,7 +787,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<DialogParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.handle_dialog(p.accept, p.prompt_text).await?;
                 Ok(if p.accept {
@@ -707,6 +798,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -717,7 +809,7 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<WaitParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 let timeout = Duration::from_secs_f64(p.timeout.unwrap_or(30.0));
                 if let Some(seconds) = p.time {
@@ -745,6 +837,7 @@ impl OndayServer {
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -764,7 +857,7 @@ impl OndayServer {
             Ok(format!("```json\n{}\n```", result.get()))
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -803,7 +896,7 @@ impl OndayServer {
                     "image/png",
                 ),
             ])),
-            Err(error) => failure(error),
+            Err(error) => self.failure(error).await,
         }
     }
 
@@ -840,7 +933,7 @@ impl OndayServer {
             })
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -895,7 +988,7 @@ impl OndayServer {
             })
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -925,7 +1018,7 @@ impl OndayServer {
             Ok(format!("Routing {}", p.pattern))
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -941,7 +1034,7 @@ impl OndayServer {
             Ok(format!("Removed route {}", p.pattern))
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(
@@ -955,7 +1048,7 @@ impl OndayServer {
         let outcome = async {
             self.page().await?;
             let mut state = self.state.lock().await;
-            let running = state.as_mut().context("no browser")?;
+            let running = state.running.as_mut().context("no browser")?;
             match p.action {
                 TabAction::List => {}
                 TabAction::New => {
@@ -1006,7 +1099,7 @@ impl OndayServer {
             Ok(out)
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 
     #[tool(name = "browser_resize", description = "Resize the viewport.")]
@@ -1014,13 +1107,14 @@ impl OndayServer {
         &self,
         Parameters(p): Parameters<ResizeParams>,
     ) -> Result<CallToolResult, McpError> {
-        reply(
+        self.reply(
             self.act(|page| async move {
                 page.set_viewport(p.width, p.height).await?;
                 Ok(format!("Viewport is {}x{}", p.width, p.height))
             })
             .await,
         )
+        .await
     }
 
     #[tool(
@@ -1029,7 +1123,7 @@ impl OndayServer {
     )]
     async fn browser_close(&self) -> Result<CallToolResult, McpError> {
         let outcome = async {
-            match self.state.lock().await.take() {
+            match self.state.lock().await.running.take() {
                 Some(running) => {
                     running.browser.close().await?;
                     Ok("Closed the browser".to_string())
@@ -1038,7 +1132,7 @@ impl OndayServer {
             }
         }
         .await;
-        reply(outcome)
+        self.reply(outcome).await
     }
 }
 

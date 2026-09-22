@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use thirtyfour::bidi::UserContextId;
-use thirtyfour::bidi::modules::browser::{DownloadBehavior, SetDownloadBehavior};
+use thirtyfour::bidi::modules::browser::{
+    DownloadBehavior, RemoveUserContext, SetDownloadBehavior,
+};
 use thirtyfour::bidi::modules::browsing_context::{CreateType, GetTree};
 use thirtyfour::{Cookie, SameSite};
 
@@ -13,7 +15,7 @@ use crate::browser::{Browser, BrowserInner, Session};
 use crate::events::DialogPolicy;
 use crate::hooks::{self, AppHooks};
 use crate::js;
-use crate::page::{Page, PageTarget};
+use crate::page::{Page, PageInner, PageTarget};
 use crate::proto::{
     AddPreloadScript, BytesValue, DeleteCookies, GetCookies, PartialCookie, Partition, SetCookie,
 };
@@ -63,7 +65,7 @@ pub(crate) struct ContextInner {
     pub(crate) hooks: Arc<dyn AppHooks>,
     pub(crate) options: ContextOptions,
     init_scripts: Mutex<Vec<String>>,
-    pages: Mutex<Vec<Page>>,
+    pages: Mutex<Vec<Arc<PageInner>>>,
     owns_session: bool,
 }
 
@@ -141,8 +143,7 @@ impl BrowserContext {
                 }),
                 user_contexts: Some(vec![context.inner.user_context_id()]),
             })
-            .await
-            .context("browser.setDownloadBehavior")?;
+            .await?;
         }
         Ok(context)
     }
@@ -171,8 +172,7 @@ impl BrowserContext {
                 contexts: None,
                 user_contexts: Some(vec![self.inner.user_context_id()]),
             })
-            .await
-            .context("script.addPreloadScript")?;
+            .await?;
         }
         Ok(())
     }
@@ -188,8 +188,7 @@ impl BrowserContext {
                         background: None,
                         user_context: self.inner.user_context.clone(),
                     })
-                    .await
-                    .context("browsingContext.create")?;
+                    .await?;
                 PageTarget::Bidi(created.context)
             }
             None => {
@@ -223,8 +222,7 @@ impl BrowserContext {
                         max_depth: Some(0),
                         root: None,
                     })
-                    .await
-                    .context("browsingContext.getTree")?;
+                    .await?;
                 let mine = self.inner.user_context_id();
                 tree.contexts
                     .into_iter()
@@ -251,8 +249,11 @@ impl BrowserContext {
         let known = self.tracked();
         let mut pages = Vec::with_capacity(live.len());
         for target in live {
-            match known.iter().find(|page| page.inner.target == target) {
-                Some(page) => pages.push(page.clone()),
+            match known.iter().find(|page| page.target == target) {
+                Some(page) => pages.push(Page {
+                    context: self.inner.clone(),
+                    inner: page.clone(),
+                }),
                 None => pages.push(self.adopt(target).await?),
             }
         }
@@ -260,7 +261,8 @@ impl BrowserContext {
             .inner
             .pages
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pages.clone();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            pages.iter().map(|page| page.inner.clone()).collect();
         Ok(pages)
     }
 
@@ -272,7 +274,7 @@ impl BrowserContext {
         }
     }
 
-    fn tracked(&self) -> Vec<Page> {
+    fn tracked(&self) -> Vec<Arc<PageInner>> {
         self.inner
             .pages
             .lock()
@@ -286,7 +288,7 @@ impl BrowserContext {
             .pages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(page.clone());
+            .push(page.inner.clone());
         Ok(page)
     }
 
@@ -298,8 +300,7 @@ impl BrowserContext {
                     .send(GetCookies {
                         partition: self.partition(),
                     })
-                    .await
-                    .context("storage.getCookies")?;
+                    .await?;
                 Ok(result
                     .cookies
                     .into_iter()
@@ -358,7 +359,7 @@ impl BrowserContext {
                         partition: self.partition(),
                     })
                     .await
-                    .with_context(|| format!("storage.setCookie {}", cookie.name))?;
+                    .with_context(|| format!("set cookie {}", cookie.name))?;
                 }
                 None => self
                     .inner
@@ -378,8 +379,7 @@ impl BrowserContext {
                 bidi.send(DeleteCookies {
                     partition: self.partition(),
                 })
-                .await
-                .context("storage.deleteCookies")?;
+                .await?;
                 Ok(())
             }
             None => self
@@ -403,10 +403,10 @@ impl BrowserContext {
         if let (Some(bidi), Some(user_context)) =
             (&self.inner.session.bidi, &self.inner.user_context)
         {
-            bidi.browser()
-                .remove_user_context(user_context.clone())
-                .await
-                .context("browser.removeUserContext")?;
+            bidi.send(RemoveUserContext {
+                user_context: user_context.clone(),
+            })
+            .await?;
             return Ok(());
         }
         if self.inner.owns_session {

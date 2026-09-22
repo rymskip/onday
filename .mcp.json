@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "onday": {
+        "type": "stdio",
+      "command": "./target/debug/onday_mcp",
+      "args": [],
+      "env": {
+        "RUST_LOG": "onday=debug,onday_mcp=debug"
+      }
+    }
+  }
+}

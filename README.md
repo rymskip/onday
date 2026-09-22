@@ -94,7 +94,13 @@ The tools follow playwright-mcp's names, plus:
 
 - `browser_launch` switches engine at runtime.
 - `browser_route` and `browser_unroute` intercept requests.
-- `browser_status` reports the session.
+- `browser_status` reports the session and the browser's health, without waiting on
+  the browser.
+
+A browser closed or crashed outside onday fails the next tool call quickly instead of
+hanging it. onday then releases that browser and stops its driver; the session, its
+directory and its profile stay. The following browser tool launches a new browser with
+the settings `browser_launch` last chose.
 
 Tools that target an element accept a snapshot `ref` or a `selector`.
 

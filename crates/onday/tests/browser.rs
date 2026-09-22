@@ -12,8 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use onday::prelude::*;
 use onday::{
-    AppHooks, DialogPolicy, Fulfill, Protocol, ProtocolPreference, RouteAction, ScreenshotOptions,
-    StrictModeViolation,
+    AppHooks, BrowserGone, DialogPolicy, Fulfill, Health, Protocol, ProtocolPreference,
+    RouteAction, ScreenshotOptions, StrictModeViolation,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -141,7 +141,7 @@ async fn status_is(page: &Page, expected: &str) -> Result<()> {
         .await
 }
 
-async fn scenario(engine: Engine, preference: ProtocolPreference) -> Result<()> {
+fn install_tracing() {
     let installed = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -149,6 +149,10 @@ async fn scenario(engine: Engine, preference: ProtocolPreference) -> Result<()> 
     if let Err(error) = installed {
         eprintln!("tracing already installed: {error}");
     }
+}
+
+async fn scenario(engine: Engine, preference: ProtocolPreference) -> Result<()> {
+    install_tracing();
     let base = serve().await?;
     let browser = Browser::launch(launch_options(engine, preference)).await?;
     let expected = if preference == ProtocolPreference::Classic {
@@ -479,6 +483,174 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     );
     other.close().await?;
     Ok(())
+}
+
+/// Run one step of a test, failing with its name instead of hanging.
+async fn step<T>(what: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    let started = std::time::Instant::now();
+    tracing::info!("step: {what}");
+    let outcome = tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .with_context(|| format!("{what} hung"))?
+        .with_context(|| format!("{what} failed"));
+    match &outcome {
+        Ok(_) => tracing::info!("step: {what} done in {:?}", started.elapsed()),
+        Err(error) => tracing::error!("step: {error:#} after {:?}", started.elapsed()),
+    }
+    outcome
+}
+
+/// One plain HTTP GET, returning the body once `Content-Length` bytes arrived.
+async fn http_get(address: &str, path: &str) -> Result<String> {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .with_context(|| format!("connect to {address}"))?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .with_context(|| format!("send GET {path}"))?;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read GET {path}"))?;
+        response.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&response);
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if read == 0 || length.is_some_and(|length| body.len() >= length) {
+                return Ok(body.to_string());
+            }
+        } else if read == 0 {
+            bail!("GET {path} closed before its headers: {text:?}");
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DevToolsTarget {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// What disappears behind onday's back.
+#[derive(Debug, Clone, Copy)]
+enum Vanish {
+    /// The tabs, as when a person closes the window.
+    Tabs,
+    /// Every DevTools target, the driver's own BiDi tab included, as in a crash.
+    Everything,
+}
+
+/// Close DevTools targets through the browser's own debugging endpoint.
+async fn close_targets(browser: &Browser, vanish: Vanish) -> Result<()> {
+    let capabilities = browser.driver().handle().capabilities();
+    let address = capabilities
+        .get("goog:chromeOptions")
+        .and_then(|options| options.get("debuggerAddress"))
+        .and_then(|address| address.as_str())
+        .context("chromedriver reported no debuggerAddress")?
+        .to_string();
+    let listing = http_get(&address, "/json/list").await?;
+    let targets: Vec<DevToolsTarget> =
+        serde_json::from_str(&listing).with_context(|| format!("parse /json/list: {listing}"))?;
+    for target in &targets {
+        let chosen = match vanish {
+            Vanish::Tabs => target.kind == "page",
+            Vanish::Everything => true,
+        };
+        if !chosen {
+            continue;
+        }
+        match (
+            http_get(&address, &format!("/json/close/{}", target.id)).await,
+            vanish,
+        ) {
+            (Ok(answer), _) => {
+                tracing::info!("closed {} {}: {}", target.kind, target.id, answer.trim())
+            }
+            // Closing the browser's own UI takes the whole process down with it.
+            (Err(error), Vanish::Everything) => {
+                tracing::info!(
+                    "the browser exited while closing {}: {error:#}",
+                    target.kind
+                );
+                return Ok(());
+            }
+            (Err(error), Vanish::Tabs) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+async fn vanishing(vanish: Vanish) -> Result<()> {
+    install_tracing();
+    let base = serve().await?;
+    let browser = step(
+        "launching chromium",
+        Browser::launch(launch_options(Engine::Chromium, ProtocolPreference::Auto)),
+    )
+    .await?;
+    let page = step("opening a page", async {
+        browser
+            .default_context(ContextOptions::default())
+            .await?
+            .page()
+            .await
+    })
+    .await?;
+    step("the first navigation", page.goto(&base, WaitUntil::Load)).await?;
+    step(
+        &format!("closing {vanish:?}"),
+        close_targets(&browser, vanish),
+    )
+    .await?;
+    let started = std::time::Instant::now();
+    let navigated = tokio::time::timeout(
+        Duration::from_secs(20),
+        page.goto(&format!("{base}/second"), WaitUntil::Load),
+    )
+    .await;
+    let took = started.elapsed();
+    tracing::info!("the navigation ended after {took:?}: {navigated:?}");
+    let health = browser.health().await;
+    tracing::info!("health after vanishing: {health}");
+    let closed = step("closing the vanished browser", browser.close()).await;
+    let navigated = navigated.context("navigating a vanished browser hung")?;
+    match navigated {
+        Err(error) if error.downcast_ref::<BrowserGone>().is_some() => {}
+        other => bail!("expected BrowserGone, got {other:?}"),
+    }
+    ensure!(
+        took < Duration::from_secs(10),
+        "noticing the vanished browser took {took:?}"
+    );
+    ensure!(
+        matches!(health, Health::Gone(_)),
+        "health after vanishing: {health}"
+    );
+    closed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome; run with --ignored"]
+async fn chromium_reports_closed_tabs() -> Result<()> {
+    vanishing(Vanish::Tabs).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome; run with --ignored"]
+async fn chromium_reports_a_vanished_browser() -> Result<()> {
+    vanishing(Vanish::Everything).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
