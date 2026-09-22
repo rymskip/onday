@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use thirtyfour::bidi::events::{
     ContextCreated, ContextDestroyed, UserPromptClosed, UserPromptOpened,
 };
-use thirtyfour::bidi::{BiDi, BidiEvent, BrowsingContextId};
+use thirtyfour::bidi::{BidiEvent, BrowsingContextId};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::channel::BidiChannel;
 use crate::proto::{
     BeforeRequestSentEvent, FetchErrorEvent, LogEntryEvent, ResponseCompletedEvent, WireHeader,
 };
@@ -290,7 +291,7 @@ impl PageEvents {
 
 /// Routes session-wide BiDi events to the page (top-level context) they belong to.
 pub(crate) struct EventHub {
-    bidi: BiDi,
+    bidi: BidiChannel,
     state: Mutex<HubState>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) created_tx: broadcast::Sender<ContextCreated>,
@@ -303,10 +304,11 @@ struct HubState {
 }
 
 impl EventHub {
-    pub(crate) async fn start(bidi: BiDi) -> anyhow::Result<Arc<EventHub>> {
+    pub(crate) async fn start(channel: BidiChannel) -> anyhow::Result<Arc<EventHub>> {
         use anyhow::Context as _;
+        let bidi = channel.raw().clone();
         let hub = Arc::new(EventHub {
-            bidi: bidi.clone(),
+            bidi: channel,
             state: Mutex::new(HubState::default()),
             tasks: Mutex::new(Vec::new()),
             created_tx: broadcast::channel(64).0,
@@ -485,7 +487,7 @@ impl EventHub {
                 )
                 .await;
             if let Err(error) = answered {
-                tracing::debug!("auto-answering a dialog failed: {error}");
+                tracing::debug!("auto-answering a dialog failed: {error:#}");
             }
         });
     }

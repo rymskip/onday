@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use thirtyfour::bidi::modules::network::{ContinueRequest, FailRequest};
-use thirtyfour::bidi::{BiDi, BrowsingContextId, InterceptId};
+use thirtyfour::bidi::{BrowsingContextId, InterceptId};
 
+use crate::channel::BidiChannel;
 use crate::events::{Header, PageEvents};
 use crate::proto::{BeforeRequestSentEvent, BytesValue, ProvideResponse, WireHeader};
 
@@ -157,7 +158,7 @@ impl RouteTable {
 }
 
 pub(crate) fn dispatch(
-    bidi: BiDi,
+    bidi: BidiChannel,
     context: BrowsingContextId,
     page: Arc<PageEvents>,
     event: BeforeRequestSentEvent,
@@ -203,7 +204,7 @@ pub(crate) fn dispatch(
                 .map(|_| ()),
         };
         if let Err(error) = sent {
-            tracing::warn!("answering an intercepted request in {context:?} failed: {error}");
+            tracing::warn!("answering an intercepted request in {context:?} failed: {error:#}");
         }
     });
 }

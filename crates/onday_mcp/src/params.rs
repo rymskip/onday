@@ -30,23 +30,27 @@ pub enum EngineParam {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LaunchParams {
     #[schemars(
-        description = "Engine to switch to: chromium, firefox or webkit. Closes the running browser first"
+        description = "Engine to switch to: chromium, firefox or webkit (default: the current one). Closes the running browser first"
     )]
     #[serde(default)]
     pub engine: Option<EngineParam>,
-    #[schemars(description = "Run without a window (default: the server's --headless setting)")]
+    #[schemars(description = "Run without a window (default: the current setting)")]
     #[serde(default)]
     pub headless: Option<bool>,
-    #[schemars(description = "Viewport width in CSS pixels")]
+    #[schemars(description = "Viewport width in CSS pixels (default: the current width)")]
     #[serde(default)]
     pub width: Option<u32>,
-    #[schemars(description = "Viewport height in CSS pixels")]
+    #[schemars(description = "Viewport height in CSS pixels (default: the current height)")]
     #[serde(default)]
     pub height: Option<u32>,
-    #[schemars(description = "Browser binary to launch instead of the configured one")]
+    #[schemars(
+        description = "Browser binary to launch instead of the configured one (default: the current one while the engine stays the same)"
+    )]
     #[serde(default)]
     pub executable_path: Option<String>,
-    #[schemars(description = "Force WebDriver Classic instead of BiDi")]
+    #[schemars(
+        description = "Force WebDriver Classic instead of BiDi (default: the current setting)"
+    )]
     #[serde(default)]
     pub classic: Option<bool>,
 }

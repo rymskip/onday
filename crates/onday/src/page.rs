@@ -14,10 +14,11 @@ use thirtyfour::bidi::modules::browsing_context::{
 };
 use thirtyfour::bidi::modules::network::{AddIntercept, InterceptPhase, RemoveIntercept};
 use thirtyfour::bidi::modules::script::Target;
-use thirtyfour::bidi::{BiDi, BrowsingContextId, NodeId};
+use thirtyfour::bidi::{BiDi, BrowsingContextId};
 use thirtyfour::{WebDriver, WebElement, WindowHandle};
 use tokio::sync::broadcast;
 
+use crate::channel::BidiChannel;
 use crate::context::ContextInner;
 use crate::events::{ConsoleMessage, Dialog, DialogPolicy, NetworkEntry, PageEvents};
 use crate::frame::{Frame, FrameRegistry, FrameTarget};
@@ -29,8 +30,8 @@ use crate::locator::Locator;
 use crate::poll::{Backoff, poll_until};
 use crate::proto::{
     CallFunction, CallResult, CaptureScreenshot, KeyAction, LocalValue, PerformActions,
-    PointerAction, PointerParameters, RemoteValue, ScreenshotClip, SharedRef, SourceActions,
-    WheelAction,
+    PointerAction, PointerParameters, RemoteValue, ScreenshotClip, SetFiles, SharedRef,
+    SourceActions, WheelAction,
 };
 use crate::route::RouteHandler;
 
@@ -249,8 +250,9 @@ pub struct ScreenshotOptions {
     pub full_page: bool,
 }
 
+/// A tab's own state. Its context tracks this, never the [`Page`], so the two do
+/// not keep each other alive.
 pub(crate) struct PageInner {
-    pub(crate) context: Arc<ContextInner>,
     pub(crate) target: PageTarget,
     pub(crate) events: Arc<PageEvents>,
     frames: FrameRegistry,
@@ -261,6 +263,7 @@ pub(crate) struct PageInner {
 /// A tab in a [`BrowserContext`](crate::BrowserContext).
 #[derive(Clone)]
 pub struct Page {
+    pub(crate) context: Arc<ContextInner>,
     pub(crate) inner: Arc<PageInner>,
 }
 
@@ -303,8 +306,8 @@ impl Page {
             hub.register(id.clone(), &events);
         }
         let page = Page {
+            context,
             inner: Arc::new(PageInner {
-                context,
                 target,
                 events,
                 frames: FrameRegistry::default(),
@@ -312,7 +315,7 @@ impl Page {
                 closed: AtomicBool::new(false),
             }),
         };
-        if let Some((width, height)) = page.inner.context.options.viewport {
+        if let Some((width, height)) = page.context.options.viewport {
             page.set_viewport(width, height).await?;
         }
         Ok(page)
@@ -321,21 +324,21 @@ impl Page {
     // ── accessors ──────────────────────────────────────────────────────────
 
     pub fn protocol(&self) -> Protocol {
-        self.inner.context.session.protocol()
+        self.context.session.protocol()
     }
 
     pub fn hooks(&self) -> &Arc<dyn AppHooks> {
-        &self.inner.context.hooks
+        &self.context.hooks
     }
 
     /// The raw thirtyfour driver behind this page.
     pub fn driver(&self) -> &WebDriver {
-        &self.inner.context.session.driver
+        &self.context.session.driver
     }
 
     /// The raw BiDi connection, when negotiated.
     pub fn bidi(&self) -> Option<&BiDi> {
-        self.inner.context.session.bidi.as_ref()
+        self.context.session.bidi.as_ref().map(BidiChannel::raw)
     }
 
     /// The BiDi browsing context id of this page.
@@ -409,7 +412,7 @@ impl Page {
 
     /// Navigate to `url` (relative URLs resolve against the context's `base_url`).
     pub async fn goto(&self, url: &str, wait: WaitUntil) -> Result<()> {
-        let url = match (&self.inner.context.options.base_url, url.contains("://")) {
+        let url = match (&self.context.options.base_url, url.contains("://")) {
             (Some(base), false) => format!(
                 "{}/{}",
                 base.trim_end_matches('/'),
@@ -432,11 +435,14 @@ impl Page {
                     (WaitUntil::Load, _) | (WaitUntil::Ready, None) => ReadinessState::Complete,
                 };
                 self.bidi_handle()?
-                    .send(Navigate {
-                        context: context.clone(),
-                        url: url.clone(),
-                        wait: Some(readiness),
-                    })
+                    .send_within(
+                        Navigate {
+                            context: context.clone(),
+                            url: url.clone(),
+                            wait: Some(readiness),
+                        },
+                        self.default_timeout(),
+                    )
                     .await
                     .with_context(|| format!("navigate to {url}"))?;
             }
@@ -486,13 +492,15 @@ impl Page {
         match &self.inner.target {
             PageTarget::Bidi(context) => {
                 self.bidi_handle()?
-                    .send(Reload {
-                        context: context.clone(),
-                        ignore_cache: None,
-                        wait: Some(ReadinessState::Complete),
-                    })
-                    .await
-                    .context("browsingContext.reload")?;
+                    .send_within(
+                        Reload {
+                            context: context.clone(),
+                            ignore_cache: None,
+                            wait: Some(ReadinessState::Complete),
+                        },
+                        self.default_timeout(),
+                    )
+                    .await?;
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -515,12 +523,14 @@ impl Page {
         match &self.inner.target {
             PageTarget::Bidi(context) => {
                 self.bidi_handle()?
-                    .send(TraverseHistory {
-                        context: context.clone(),
-                        delta,
-                    })
-                    .await
-                    .context("browsingContext.traverseHistory")?;
+                    .send_within(
+                        TraverseHistory {
+                            context: context.clone(),
+                            delta,
+                        },
+                        self.default_timeout(),
+                    )
+                    .await?;
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -544,8 +554,7 @@ impl Page {
                         max_depth: Some(0),
                         root: Some(context.clone()),
                     })
-                    .await
-                    .context("browsingContext.getTree")?;
+                    .await?;
                 tree.contexts
                     .into_iter()
                     .next()
@@ -774,8 +783,7 @@ impl Page {
                 arguments,
                 user_activation,
             })
-            .await
-            .context("script.callFunction")?;
+            .await?;
         match result {
             CallResult::Success { result } => Ok(result),
             CallResult::Exception { exception_details } => bail!(
@@ -977,7 +985,7 @@ impl Page {
     /// top document that has the runtime, installs the capture hooks. Frames skip the
     /// capture because they share the top document's sessionStorage buffers.
     fn classic_prelude(&self, frame: &Frame) -> String {
-        let init = js::init_prelude(&self.inner.context.init_scripts());
+        let init = js::init_prelude(&self.context.init_scripts());
         if frame.target == FrameTarget::Top {
             // Outside the once-per-document init block: a call that runs before the
             // runtime is installed must not use up the document's only chance.
@@ -1020,7 +1028,7 @@ impl Page {
         });
         tokio::select! {
             sent = command => {
-                sent.with_context(|| format!("input.performActions ({what})"))?;
+                sent.with_context(|| format!("send {what}"))?;
                 Ok(())
             }
             opened = dialogs.recv() => {
@@ -1232,14 +1240,14 @@ impl Page {
         match &element.handle {
             Handle::Bidi(shared_id) => {
                 self.bidi_handle()?
-                    .input()
-                    .set_files(
-                        self.bidi_context(&element.frame)?,
-                        &NodeId::from(shared_id.clone()),
+                    .send(SetFiles {
+                        context: self.bidi_context(&element.frame)?,
+                        element: SharedRef {
+                            shared_id: shared_id.clone(),
+                        },
                         files,
-                    )
-                    .await
-                    .context("input.setFiles")?;
+                    })
+                    .await?;
                 Ok(())
             }
             Handle::Classic(input) => {
@@ -1271,8 +1279,7 @@ impl Page {
                         },
                         clip: None,
                     })
-                    .await
-                    .context("browsingContext.captureScreenshot")?;
+                    .await?;
                 decode_png(&shot.data)
             }
             PageTarget::Classic(_) => {
@@ -1331,7 +1338,7 @@ impl Page {
                         clip: Some(clip),
                     })
                     .await
-                    .context("browsingContext.captureScreenshot (element)")?;
+                    .context("capture the element")?;
                 decode_png(&shot.data)
             }
             Handle::Classic(target) => {
@@ -1357,8 +1364,7 @@ impl Page {
                         viewport: Some(Viewport { width, height }),
                         device_pixel_ratio: None,
                     })
-                    .await
-                    .context("browsingContext.setViewport")?;
+                    .await?;
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -1385,8 +1391,7 @@ impl Page {
                     .send(Activate {
                         context: context.clone(),
                     })
-                    .await
-                    .context("browsingContext.activate")?;
+                    .await?;
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -1404,8 +1409,7 @@ impl Page {
                         context: context.clone(),
                         prompt_unload: None,
                     })
-                    .await
-                    .context("browsingContext.close")?;
+                    .await?;
             }
             PageTarget::Classic(handle) => {
                 let mut current = self.classic_window().await?;
@@ -1472,8 +1476,7 @@ impl Page {
                         accept: Some(accept),
                         user_text: prompt_text,
                     })
-                    .await
-                    .context("browsingContext.handleUserPrompt")?;
+                    .await?;
                 self.inner.events.set_dialog(None);
             }
             PageTarget::Classic(_) => {
@@ -1576,8 +1579,7 @@ impl Page {
                     contexts: vec![context.clone()],
                     url_patterns: None,
                 })
-                .await
-                .context("network.addIntercept")?;
+                .await?;
             self.inner.events.routes.set_intercept(intercept.intercept);
         }
         Ok(())
@@ -1587,8 +1589,7 @@ impl Page {
         if let Some(intercept) = self.inner.events.routes.remove(glob) {
             self.bidi_handle()?
                 .send(RemoveIntercept { intercept })
-                .await
-                .context("network.removeIntercept")?;
+                .await?;
         }
         Ok(())
     }
@@ -1599,8 +1600,11 @@ impl Page {
 
     // ── plumbing ───────────────────────────────────────────────────────────
 
-    fn bidi_handle(&self) -> Result<&BiDi> {
-        self.bidi()
+    fn bidi_handle(&self) -> Result<&BidiChannel> {
+        self.context
+            .session
+            .bidi
+            .as_ref()
             .context("this page's session has no BiDi connection")
     }
 
@@ -1666,7 +1670,7 @@ impl Page {
         let PageTarget::Classic(handle) = &self.inner.target else {
             bail!("not a Classic page");
         };
-        let mut current = self.inner.context.session.classic_window.lock().await;
+        let mut current = self.context.session.classic_window.lock().await;
         if current.as_ref() != Some(handle) {
             self.driver()
                 .switch_to_window(handle.clone())
