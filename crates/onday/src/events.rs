@@ -5,12 +5,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thirtyfour::bidi::events::{
-    ContextCreated, ContextDestroyed, UserPromptClosed, UserPromptOpened,
+    ContextCreated, ContextDestroyed, DomContentLoaded, FragmentNavigated, Load, NavigationAborted,
+    NavigationCommitted, NavigationFailed, NavigationStarted, UserPromptClosed, UserPromptOpened,
 };
-use thirtyfour::bidi::{BidiEvent, BrowsingContextId};
-use tokio::sync::broadcast;
+use thirtyfour::bidi::{BidiEvent, BrowsingContextId, NavigationId, RawEvent, RawEventStream};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::channel::BidiChannel;
@@ -97,6 +99,44 @@ pub enum DialogPolicy {
     Leave,
 }
 
+/// How far the page's newest top-level navigation has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum LoadPhase {
+    Started,
+    /// The new document exists.
+    Committed,
+    DomContentLoaded,
+    #[default]
+    Loaded,
+    /// Failed or aborted before committing, so no document of its own exists.
+    Failed,
+}
+
+impl LoadPhase {
+    /// Whether a navigation at this phase has loaded at least as far as `wanted`.
+    pub(crate) fn reached(self, wanted: LoadPhase) -> bool {
+        self != LoadPhase::Failed && self >= wanted
+    }
+}
+
+/// What one navigation event does to the page's newest navigation.
+enum Step {
+    Started,
+    /// A same-document navigation, which starts and completes in one event.
+    InPlace,
+    Reached(LoadPhase),
+}
+
+/// The page's newest top-level navigation, as the browser's navigation events report it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NavigationState {
+    /// Top-level navigations started so far, so a waiter can ignore ones from before its own.
+    pub(crate) started: u64,
+    pub(crate) id: Option<NavigationId>,
+    pub(crate) url: String,
+    pub(crate) phase: LoadPhase,
+}
+
 #[derive(Debug, Default)]
 struct History {
     console: VecDeque<ConsoleMessage>,
@@ -114,6 +154,7 @@ pub(crate) struct PageEvents {
     pub(crate) console_tx: broadcast::Sender<ConsoleMessage>,
     pub(crate) network_tx: broadcast::Sender<NetworkEntry>,
     pub(crate) dialog_tx: broadcast::Sender<Dialog>,
+    pub(crate) navigation: watch::Sender<NavigationState>,
     pub(crate) routes: RouteTable,
 }
 
@@ -126,6 +167,7 @@ impl PageEvents {
             console_tx: broadcast::channel(1024).0,
             network_tx: broadcast::channel(1024).0,
             dialog_tx: broadcast::channel(16).0,
+            navigation: watch::channel(NavigationState::default()).0,
             routes: RouteTable::default(),
         })
     }
@@ -281,6 +323,55 @@ impl PageEvents {
             .clone()
     }
 
+    /// A new top-level navigation; a same-document one starts already `Loaded`.
+    pub(crate) fn navigation_started(
+        &self,
+        id: Option<NavigationId>,
+        url: String,
+        phase: LoadPhase,
+    ) {
+        self.navigation.send_modify(|state| {
+            state.started += 1;
+            state.id = id;
+            state.url = url;
+            state.phase = phase;
+        });
+    }
+
+    /// Advance the newest navigation. Events for a navigation it replaced are stale,
+    /// and a navigation never moves back to an earlier phase. A failure after commit
+    /// means a script on the new document replaced it, so the replacement, not a
+    /// failure, is what follows.
+    pub(crate) fn navigation_reached(
+        &self,
+        id: Option<&NavigationId>,
+        url: String,
+        phase: LoadPhase,
+    ) {
+        self.navigation.send_if_modified(|state| {
+            let newest = id.is_none() || state.id.as_ref() == id;
+            let advances = match phase {
+                LoadPhase::Failed => state.phase == LoadPhase::Started,
+                // Firefox labels the replaced document's events with its successor's id,
+                // so a load only counts once the navigation has committed.
+                LoadPhase::DomContentLoaded | LoadPhase::Loaded => {
+                    state.phase >= LoadPhase::Committed
+                        && state.phase != LoadPhase::Failed
+                        && phase > state.phase
+                }
+                LoadPhase::Started | LoadPhase::Committed => {
+                    state.phase != LoadPhase::Failed && phase > state.phase
+                }
+            };
+            if !newest || !advances {
+                return false;
+            }
+            state.url = url;
+            state.phase = phase;
+            true
+        });
+    }
+
     pub(crate) fn policy(&self) -> DialogPolicy {
         *self
             .policy
@@ -314,6 +405,26 @@ impl EventHub {
             created_tx: broadcast::channel(64).0,
         });
         let mut tasks = Vec::new();
+        // One ordered stream, so a replaced navigation's failure cannot overtake its successor's start.
+        tasks.push(spawn_navigation_stream(&hub, bidi.subscribe_raw()));
+        bidi.session()
+            .subscribe_many(
+                [
+                    NavigationStarted::METHOD,
+                    NavigationCommitted::METHOD,
+                    FragmentNavigated::METHOD,
+                    DomContentLoaded::METHOD,
+                    Load::METHOD,
+                    NavigationFailed::METHOD,
+                ]
+                .map(String::from),
+            )
+            .await
+            .context("subscribe browsingContext navigation events")?;
+        if let Err(error) = bidi.session().subscribe(NavigationAborted::METHOD).await {
+            // Firefox has no such event; it reports a replaced navigation as navigationFailed.
+            tracing::debug!("the browser has no {}: {error}", NavigationAborted::METHOD);
+        }
         tasks.push(spawn_stream::<LogEntryEvent>(
             &hub,
             bidi.subscribe().await.context("subscribe log.entryAdded")?,
@@ -498,6 +609,65 @@ impl EventHub {
         }
     }
 
+    fn on_navigation(self: &Arc<Self>, event: RawEvent) {
+        let method = event.method.as_str();
+        let decoded = match method {
+            NavigationStarted::METHOD => decode::<NavigationStarted>(event.params).map(|started| {
+                (
+                    started.context,
+                    started.navigation,
+                    started.url,
+                    Step::Started,
+                )
+            }),
+            NavigationCommitted::METHOD => {
+                decode::<NavigationCommitted>(event.params).map(|committed| {
+                    let step = Step::Reached(LoadPhase::Committed);
+                    (committed.context, committed.navigation, committed.url, step)
+                })
+            }
+            FragmentNavigated::METHOD => decode::<FragmentNavigated>(event.params)
+                .map(|moved| (moved.context, moved.navigation, moved.url, Step::InPlace)),
+            DomContentLoaded::METHOD => decode::<DomContentLoaded>(event.params).map(|loaded| {
+                let step = Step::Reached(LoadPhase::DomContentLoaded);
+                (loaded.context, loaded.navigation, loaded.url, step)
+            }),
+            Load::METHOD => decode::<Load>(event.params).map(|loaded| {
+                let step = Step::Reached(LoadPhase::Loaded);
+                (loaded.context, loaded.navigation, loaded.url, step)
+            }),
+            NavigationFailed::METHOD => decode::<NavigationFailed>(event.params).map(|failed| {
+                let step = Step::Reached(LoadPhase::Failed);
+                (failed.context, failed.navigation, failed.url, step)
+            }),
+            NavigationAborted::METHOD => decode::<NavigationAborted>(event.params).map(|aborted| {
+                let step = Step::Reached(LoadPhase::Failed);
+                (aborted.context, aborted.navigation, aborted.url, step)
+            }),
+            _ => return,
+        };
+        let (context, navigation, url, step) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!("undecodable {method} event: {error}");
+                return;
+            }
+        };
+        let Some((top, page)) = self.page_for(Some(&context)) else {
+            return;
+        };
+        // A frame's navigation is not the page's.
+        if top != context {
+            return;
+        }
+        tracing::debug!("{method} {navigation:?} {url}");
+        match step {
+            Step::Started => page.navigation_started(navigation, url, LoadPhase::Started),
+            Step::InPlace => page.navigation_started(navigation, url, LoadPhase::Loaded),
+            Step::Reached(phase) => page.navigation_reached(navigation.as_ref(), url, phase),
+        }
+    }
+
     fn on_context_created(self: &Arc<Self>, event: ContextCreated) {
         if let Some(parent) = &event.0.parent {
             self.lock()
@@ -527,6 +697,22 @@ impl Drop for EventHub {
             task.abort();
         }
     }
+}
+
+fn decode<E: DeserializeOwned>(params: serde_json::Value) -> serde_json::Result<E> {
+    serde_json::from_value(params)
+}
+
+fn spawn_navigation_stream(hub: &Arc<EventHub>, mut stream: RawEventStream) -> JoinHandle<()> {
+    let weak = Arc::downgrade(hub);
+    tokio::spawn(async move {
+        while let Some(event) = stream.next().await {
+            let Some(hub) = weak.upgrade() else {
+                return;
+            };
+            hub.on_navigation(event);
+        }
+    })
 }
 
 fn spawn_stream<E: BidiEvent>(
