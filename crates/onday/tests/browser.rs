@@ -36,17 +36,19 @@ async fn serve() -> Result<String> {
     );
     let address = listener.local_addr().context("fixture address")?;
     let index = Arc::new(INDEX.replace("__CROSS_ORIGIN__", &remote_origin));
-    tokio::spawn(accept(listener, index.clone()));
-    tokio::spawn(accept(remote, index));
+    let remote_origin = Arc::new(remote_origin);
+    tokio::spawn(accept(listener, index.clone(), remote_origin.clone()));
+    tokio::spawn(accept(remote, index, remote_origin));
     Ok(format!("http://{address}"))
 }
 
-async fn accept(listener: tokio::net::TcpListener, index: Arc<String>) {
+async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_origin: Arc<String>) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
         let index = index.clone();
+        let remote_origin = remote_origin.clone();
         tokio::spawn(async move {
             let mut request = Vec::new();
             let mut buffer = [0u8; 4096];
@@ -58,10 +60,30 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>) {
             }
             let head = String::from_utf8_lossy(&request);
             let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let location = match path.as_str() {
+                "/redirect" => Some("/second".to_string()),
+                "/redirect-remote" => Some(format!("{remote_origin}/second")),
+                _ => None,
+            };
+            if let Some(location) = location {
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                if let Err(error) = stream.write_all(response.as_bytes()).await {
+                    eprintln!("fixture write failed: {error}");
+                }
+                return;
+            }
             let (status, kind, body) = match path.as_str() {
                 "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
                 "/second" => ("200 OK", "text/html; charset=utf-8", SECOND.to_string()),
                 "/frame" => ("200 OK", "text/html; charset=utf-8", FRAME.to_string()),
+                "/script-redirect" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    "<!doctype html><title>Leaving</title><script>location.replace('/second')</script>"
+                        .to_string(),
+                ),
                 "/api/data" => (
                     "200 OK",
                     "application/json",
@@ -185,6 +207,7 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         .await?;
     let page = context.page().await?;
     page.set_default_timeout(Duration::from_secs(10));
+    redirects(&page, base).await?;
     page.goto(base, WaitUntil::Load).await?;
     expect_page(&page).to_have_title("Onday fixture").await?;
     ensure!(
@@ -486,6 +509,46 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
 }
 
 /// Run one step of a test, failing with its name instead of hanging.
+/// `goto` settles on wherever a redirect lands, not on the URL it was given.
+async fn redirects(page: &Page, base: &str) -> Result<()> {
+    for path in ["/redirect", "/redirect-remote", "/script-redirect"] {
+        let started = std::time::Instant::now();
+        step(
+            &format!("following {path}"),
+            page.goto(&format!("{base}{path}"), WaitUntil::Load),
+        )
+        .await?;
+        let landed = page.url().await?;
+        tracing::info!("{path} landed on {landed} after {:?}", started.elapsed());
+        ensure!(landed.ends_with("/second"), "{path} landed on {landed}");
+    }
+    step(
+        "following /script-redirect to DOMContentLoaded",
+        page.goto(
+            &format!("{base}/script-redirect"),
+            WaitUntil::DomContentLoaded,
+        ),
+    )
+    .await?;
+    let landed = page.url().await?;
+    ensure!(
+        landed.ends_with("/second"),
+        "/script-redirect to DOMContentLoaded landed on {landed}"
+    );
+    // A same-document navigation has no load event of its own.
+    step(
+        "following a fragment",
+        page.goto(&format!("{base}/second#below"), WaitUntil::Load),
+    )
+    .await?;
+    let landed = page.url().await?;
+    ensure!(
+        landed.ends_with("#below"),
+        "the fragment landed on {landed}"
+    );
+    Ok(())
+}
+
 async fn step<T>(what: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
     let started = std::time::Instant::now();
     tracing::info!("step: {what}");

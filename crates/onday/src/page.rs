@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 
 use crate::channel::BidiChannel;
 use crate::context::ContextInner;
-use crate::events::{ConsoleMessage, Dialog, DialogPolicy, NetworkEntry, PageEvents};
+use crate::events::{ConsoleMessage, Dialog, DialogPolicy, LoadPhase, NetworkEntry, PageEvents};
 use crate::frame::{Frame, FrameRegistry, FrameTarget};
 use crate::hooks::AppHooks;
 use crate::js;
@@ -429,22 +429,30 @@ impl Page {
         }
         match &self.inner.target {
             PageTarget::Bidi(context) => {
-                let readiness = match (wait, &ready) {
-                    (WaitUntil::Commit, _) | (WaitUntil::Ready, Some(_)) => ReadinessState::None,
-                    (WaitUntil::DomContentLoaded, _) => ReadinessState::Interactive,
-                    (WaitUntil::Load, _) | (WaitUntil::Ready, None) => ReadinessState::Complete,
+                let wanted = match (wait, &ready) {
+                    (WaitUntil::Commit, _) | (WaitUntil::Ready, Some(_)) => None,
+                    (WaitUntil::DomContentLoaded, _) => Some(LoadPhase::DomContentLoaded),
+                    (WaitUntil::Load, _) | (WaitUntil::Ready, None) => Some(LoadPhase::Loaded),
                 };
+                let since = self.inner.events.navigation.borrow().started;
+                // Navigate's own wait tracks only the navigation it started, which a
+                // script redirect replaces; the settle below follows the replacement.
                 self.bidi_handle()?
                     .send_within(
                         Navigate {
                             context: context.clone(),
                             url: url.clone(),
-                            wait: Some(readiness),
+                            wait: Some(ReadinessState::None),
                         },
                         self.default_timeout(),
                     )
                     .await
                     .with_context(|| format!("navigate to {url}"))?;
+                if let Some(wanted) = wanted {
+                    self.settle_navigation(since, wanted)
+                        .await
+                        .with_context(|| format!("navigate to {url}"))?;
+                }
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -457,6 +465,39 @@ impl Page {
         }
         if let Some(script) = ready {
             self.wait_for_ready(&script, self.default_timeout()).await?;
+        }
+        Ok(())
+    }
+
+    /// Wait until the newest top-level navigation after `since` reaches `wanted`,
+    /// following any navigation that replaces it, as a script redirect does.
+    async fn settle_navigation(&self, since: u64, wanted: LoadPhase) -> Result<()> {
+        let mut navigation = self.inner.events.navigation.subscribe();
+        let timeout = self.default_timeout();
+        let settled = tokio::time::timeout(timeout, async {
+            navigation
+                .wait_for(|state| {
+                    state.started > since
+                        && (state.phase.reached(wanted) || state.phase == LoadPhase::Failed)
+                })
+                .await
+                .map(|state| state.clone())
+        })
+        .await;
+        let state = match settled {
+            Ok(Ok(state)) => state,
+            Ok(Err(closed)) => return Err(closed).context("the page's navigation events stopped"),
+            Err(_) => {
+                let state = self.inner.events.navigation.borrow();
+                bail!(
+                    "no navigation reached {wanted:?} within {timeout:?}; the newest is {} at {:?}",
+                    state.url,
+                    state.phase
+                );
+            }
+        };
+        if state.phase == LoadPhase::Failed {
+            bail!("the navigation to {} failed", state.url);
         }
         Ok(())
     }
@@ -491,16 +532,20 @@ impl Page {
     pub async fn reload(&self) -> Result<()> {
         match &self.inner.target {
             PageTarget::Bidi(context) => {
+                let since = self.inner.events.navigation.borrow().started;
                 self.bidi_handle()?
                     .send_within(
                         Reload {
                             context: context.clone(),
                             ignore_cache: None,
-                            wait: Some(ReadinessState::Complete),
+                            wait: Some(ReadinessState::None),
                         },
                         self.default_timeout(),
                     )
                     .await?;
+                self.settle_navigation(since, LoadPhase::Loaded)
+                    .await
+                    .context("reload")?;
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
