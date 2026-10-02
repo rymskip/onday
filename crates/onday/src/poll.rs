@@ -37,9 +37,25 @@ impl Backoff {
 }
 
 /// Poll `probe` until it reports `true` or `budget` elapses; returns whether it held.
-///
-/// `on_progress` fires roughly every 5s with the elapsed time.
-pub async fn poll_until<F, Fut>(
+pub async fn poll_until<F, Fut>(mut probe: F, budget: Duration, backoff: Backoff) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    poll_until_ok(
+        || {
+            let held = probe();
+            async move { Ok(held.await.then_some(())) }
+        },
+        budget,
+        backoff,
+    )
+    .await
+    .is_ok()
+}
+
+/// [`poll_until`] that also calls `on_progress` with the elapsed time roughly every 5s.
+pub async fn poll_until_reporting<F, Fut>(
     mut probe: F,
     budget: Duration,
     backoff: Backoff,

@@ -377,7 +377,6 @@ async fn spawn_driver(binary: &Path, log: Option<&Path>) -> Result<SpawnedDriver
         || async { tokio::net::TcpStream::connect(address).await.is_ok() },
         Duration::from_secs(15),
         Backoff::SERVICE,
-        |_| {},
     )
     .await;
     if !listening {

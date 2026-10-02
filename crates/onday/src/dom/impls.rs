@@ -1,21 +1,98 @@
 //! [`WebDriverExt`] for a live thirtyfour session.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, Instant};
 use thirtyfour::prelude::*;
 use tracing::debug;
 
+use super::runtime::call_lib;
 use super::wait::wait_until_interactable;
-use super::*;
+use super::{WebDriverExt, escape_js_single, testid_selector, typed_in_order};
 use crate::js;
 use crate::poll::{Backoff, poll_until, poll_until_ok};
 
 async fn script_bool(driver: &WebDriver, script: &str) -> bool {
     match driver.execute(script, Vec::new()).await {
-        Ok(returned) => returned.convert::<bool>().unwrap_or(false),
-        Err(_) => false,
+        Ok(returned) => returned.convert::<bool>().unwrap_or_else(|error| {
+            debug!("script returned a non-boolean: {error:#}");
+            false
+        }),
+        Err(error) => {
+            debug!("script failed: {error:#}");
+            false
+        }
     }
+}
+
+const PRESCROLL: &str = "(lib, selector) => {
+    const el = document.querySelector(selector);
+    if (el) lib.prescroll(el);
+    return true;
+}";
+
+/// Scroll the target into view clear of sticky overlays. Best effort: the settle
+/// and the click that follow report a target that is still out of reach.
+async fn prescroll(driver: &WebDriver, selector: &str) {
+    let scrolled = match serde_json::to_value(selector) {
+        Ok(selector) => call_lib::<bool>(driver, PRESCROLL, vec![selector]).await,
+        Err(error) => Err(error).context("serialize selector"),
+    };
+    if let Err(error) = scrolled {
+        debug!("prescroll failed for {selector}: {error:#}");
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TypingKind {
+    Input,
+    Textarea,
+    Editable,
+    Native,
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypingState {
+    kind: TypingKind,
+    #[serde(rename = "type")]
+    input_type: Option<String>,
+    text: String,
+    focused: bool,
+    on_top: String,
+    active: String,
+}
+
+const TYPING_STATE: &str = "(lib, selector) => {
+    const el = document.querySelector(selector);
+    if (!el) throw new Error('element not found: ' + selector);
+    return lib.typingState(el);
+}";
+
+/// The browser's select-all modifier: Command on macOS, Control elsewhere. Read from
+/// the session rather than the host, so a remote browser gets its own platform's key.
+fn select_all_modifier(driver: &WebDriver) -> Result<Key> {
+    let platform = driver
+        .handle()
+        .capabilities()
+        .get("platformName")
+        .and_then(|name| name.as_str())
+        .context("the session reported no platformName to pick the select-all modifier")?;
+    Ok(if platform.to_ascii_lowercase().starts_with("mac") {
+        Key::Meta
+    } else {
+        Key::Control
+    })
+}
+
+async fn typing_state(driver: &WebDriver, selector: &str) -> Result<TypingState> {
+    let selector_value = serde_json::to_value(selector).context("serialize selector")?;
+    call_lib(driver, TYPING_STATE, vec![selector_value])
+        .await
+        .with_context(|| format!("read the typing state of {selector}"))
 }
 
 impl WebDriverExt for WebDriver {
@@ -42,13 +119,8 @@ impl WebDriverExt for WebDriver {
         let escaped = escape_js_single(selector);
         // Existence is checked in JS first, which avoids driver interactability errors mid-hydration.
         let exists_script = format!("return document.querySelector('{escaped}') !== null");
-        let present = poll_until(
-            || script_bool(self, &exists_script),
-            timeout,
-            Backoff::FAST,
-            |_| {},
-        )
-        .await;
+        let present =
+            poll_until(|| script_bool(self, &exists_script), timeout, Backoff::FAST).await;
         if !present {
             bail!(
                 "timed out waiting for selector: {} (after {:?})",
@@ -90,18 +162,10 @@ impl WebDriverExt for WebDriver {
         // Stale, not-interactable and intercepted are transient during a re-render,
         // so the settle-find-click cycle is retried until the budget runs out.
         let start = Instant::now();
-        let escaped_selector = escape_js_single(selector);
-        let prescroll_script = format!(
-            r#"const el = document.querySelector('{escaped_selector}');
-if (!el) return;
-{SCROLL_TO_TARGET_VIA_SCROLLBAR}"#
-        );
         loop {
             self.wait_for_selector(selector, timeout).await?;
             // Scroll first, then settle: the scroll itself moves the target.
-            if let Err(e) = self.execute(&prescroll_script, Vec::new()).await {
-                debug!("prescroll before click failed for {selector}: {e:#}");
-            }
+            prescroll(self, selector).await;
             wait_until_interactable(self, selector, timeout).await?;
             let element = self.find(By::Css(selector)).await.with_context(|| {
                 format!("failed to re-find selector after settling: {}", selector)
@@ -172,13 +236,7 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
             "return !!(document.body && document.body.innerText.includes({}))",
             js::js_single_quoted(text)
         );
-        let found = poll_until(
-            || script_bool(self, &script),
-            timeout,
-            Backoff::FAST,
-            |_| {},
-        )
-        .await;
+        let found = poll_until(|| script_bool(self, &script), timeout, Backoff::FAST).await;
         if found {
             return Ok(());
         }
@@ -190,13 +248,7 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
             "return !(document.body && document.body.innerText.includes({}))",
             js::js_single_quoted(text)
         );
-        let hidden = poll_until(
-            || script_bool(self, &script),
-            timeout,
-            Backoff::FAST,
-            |_| {},
-        )
-        .await;
+        let hidden = poll_until(|| script_bool(self, &script), timeout, Backoff::FAST).await;
         if hidden {
             return Ok(());
         }
@@ -205,10 +257,17 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
 
     async fn expect_hidden(&self, selector: &str, timeout: Duration) -> Result<()> {
         let hidden = poll_until(
-            || async { !self.selector_exists(selector).await.unwrap_or(false) },
+            || async {
+                match self.selector_exists(selector).await {
+                    Ok(exists) => !exists,
+                    Err(error) => {
+                        debug!("checking whether {selector} is gone failed: {error:#}");
+                        false
+                    }
+                }
+            },
             timeout,
             Backoff::FAST,
-            |_| {},
         )
         .await;
         if hidden {
@@ -226,7 +285,6 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
             },
             timeout,
             Backoff::FAST,
-            |_| {},
         )
         .await;
         if arrived {
@@ -251,56 +309,82 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
         text: &str,
         timeout: Duration,
     ) -> Result<()> {
+        let start = Instant::now();
+        let remaining = || timeout.saturating_sub(start.elapsed());
         self.wait_for_selector(selector, timeout).await?;
+        prescroll(self, selector).await;
         // Settle before acquiring the handle, or a re-render leaves it stale.
-        wait_until_interactable(self, selector, timeout).await?;
+        wait_until_interactable(self, selector, remaining()).await?;
+        let before = typing_state(self, selector).await?;
+        match before.kind {
+            TypingKind::Native => bail!(
+                "{selector} is an <input type={}>: text typing does not apply to that input type",
+                before.input_type.as_deref().unwrap_or_default()
+            ),
+            TypingKind::Other => {
+                bail!("{selector} is not an input, textarea or contenteditable element")
+            }
+            TypingKind::Input | TypingKind::Textarea | TypingKind::Editable => {}
+        }
         let element = self
             .find(By::Css(selector))
             .await
             .with_context(|| format!("failed to re-find selector after settling: {}", selector))?;
-        // Clicking focuses inputs and focusable non-inputs alike.
-        element
+        // A pointer click lands on whatever is on top, as a person's does; a label
+        // over the field forwards focus to it, and the focus check catches the rest.
+        self.action_chain()
+            .move_to_element_center(&element)
             .click()
+            .perform()
             .await
-            .with_context(|| format!("failed to focus selector: {}", selector))?;
-        // Clear through the native value setter so framework bindings see the
-        // change; non-inputs have no value slot and skip it.
-        let escaped = escape_js_single(selector);
-        let is_form_input = self
-            .execute(
-                format!(
-                    r#"const el = document.querySelector('{escaped}');
-if (!el) throw new Error('type_into_selector: element not found: {escaped}');
-const isFormInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
-if (isFormInput) {{
-    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-    setter.call(el, '');
-    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-}}
-return isFormInput;"#,
-                ),
-                Vec::new(),
-            )
-            .await
-            .with_context(|| format!("clear {selector}"))?
-            .convert::<bool>()
-            .with_context(|| format!("read whether {selector} is a form input"))?;
-        if !text.is_empty() {
-            if is_form_input {
-                element
-                    .send_keys(text)
-                    .await
-                    .with_context(|| format!("failed to send keys to {}", selector))?;
-            } else {
-                // `send_keys` rejects non-inputs; send through the focused element instead.
-                self.action_chain()
-                    .send_keys(text)
-                    .perform()
-                    .await
-                    .with_context(|| format!("failed to action-send keys to {}", selector))?;
+            .with_context(|| format!("pointer click on {selector}"))?;
+        let focused = typing_state(self, selector).await?;
+        if !focused.focused {
+            bail!(
+                "{selector} did not take focus: the click landed on {}, focus is on {}",
+                before.on_top,
+                focused.active
+            );
+        }
+        if !focused.text.is_empty() {
+            // One selection delete, so a mask sees a single edit and an input handler fires once.
+            let modifier = select_all_modifier(self)?;
+            self.action_chain()
+                .key_down(modifier.clone())
+                .key_down('a')
+                .key_up('a')
+                .key_up(modifier)
+                .key_down(Key::Backspace)
+                .key_up(Key::Backspace)
+                .perform()
+                .await
+                .with_context(|| format!("clear {selector}"))?;
+            let cleared = typing_state(self, selector).await?;
+            if !cleared.text.is_empty() {
+                bail!("clearing {selector} left {:?}", cleared.text);
             }
         }
-        Ok(())
+        if !text.is_empty() {
+            self.action_chain()
+                .send_keys(text)
+                .perform()
+                .await
+                .with_context(|| format!("type into {selector}"))?;
+        }
+        poll_until_ok(
+            || async {
+                let landed = typing_state(self, selector).await?.text;
+                if typed_in_order(text, &landed) {
+                    return Ok(Some(()));
+                }
+                Err(anyhow!("{selector} holds {landed:?} after typing {text:?}"))
+            },
+            remaining(),
+            Backoff::FAST,
+        )
+        .await
+        .map_err(|last| {
+            last.unwrap_or_else(|| anyhow!("{selector}: the typed value was never read back"))
+        })
     }
 }

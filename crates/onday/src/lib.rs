@@ -46,7 +46,7 @@ pub use hooks::{AppHooks, DefaultHooks};
 pub use launch::{DriverSource, LaunchOptions, PromptBehavior, Protocol, ProtocolPreference};
 pub use locator::{ClickOptions, ElementInfo, ElementState, Locator, StrictModeViolation};
 pub use page::{Keyboard, Mouse, MouseButton, Page, ScreenshotOptions, WaitUntil};
-pub use poll::{Backoff, poll_until, poll_until_blocking, poll_until_ok};
+pub use poll::{Backoff, poll_until, poll_until_blocking, poll_until_ok, poll_until_reporting};
 pub use route::{Fulfill, InterceptedRequest, RouteAction, RouteHandler};
 pub use thirtyfour;
 pub use webauthn::{

@@ -33,6 +33,20 @@
     </select>
     <input id="when" type="date" aria-label="When">
     <div id="editor" contenteditable="true" role="textbox" aria-label="Editor">draft</div>
+    <div style="position: relative; display: inline-block">
+      <input id="float" value="old" style="width: 200px; height: 40px; box-sizing: border-box">
+      <label for="float" style="position: absolute; inset: 0; display: flex; align-items: center; padding-left: 8px">Floating</label>
+    </div>
+    <label>Name <input id="wrapped" value="Ada"></label>
+    <input id="phone" aria-label="Phone" value="(555) 000-0000" oninput="maskPhone(this)">
+    <input id="search" aria-label="Search" value="xyz" oninput="window.__searchInputs = (window.__searchInputs || 0) + 1">
+    <input id="qty" type="number" step="any" aria-label="Quantity" value="12.5">
+    <textarea id="notes" aria-label="Notes">first line
+second line</textarea>
+    <div style="position: relative; display: inline-block">
+      <input id="covered" aria-label="Covered" value="">
+      <div id="toast" style="position: absolute; inset: 0; background: #fc0">Saved</div>
+    </div>
     <input id="upload" type="file" style="display:none">
     <button id="alert-btn" onclick="document.getElementById('status').textContent = confirm('Proceed?') ? 'confirmed' : 'cancelled'">Ask</button>
     <button id="fetch-btn" onclick="load()">Load data</button>
@@ -52,6 +66,13 @@
   </main>
   <script>
     let count = 0;
+    function maskPhone(input) {
+      const digits = input.value.replace(/\D/g, '').slice(0, 10);
+      if (digits.length > 6) input.value = '(' + digits.slice(0, 3) + ') ' + digits.slice(3, 6) + '-' + digits.slice(6);
+      else if (digits.length > 3) input.value = '(' + digits.slice(0, 3) + ') ' + digits.slice(3);
+      else if (digits.length > 0) input.value = '(' + digits;
+      else input.value = '';
+    }
     function bump() { count++; document.querySelector('[data-testid=count]').textContent = String(count); }
     async function load() {
       const res = await fetch('/api/data');

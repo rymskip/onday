@@ -295,6 +295,7 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     page.locator("#email").press("ControlOrMeta+A").await?;
     page.keyboard().press("Backspace").await?;
     expect(&page.locator("#email")).to_have_value("").await?;
+    typing(&page).await?;
 
     // Snapshot refs.
     let snapshot = page.snapshot().await?;
@@ -426,7 +427,6 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         },
         Duration::from_secs(5),
         onday::Backoff::FAST,
-        |_| {},
     )
     .await;
     ensure!(
@@ -445,7 +445,6 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         },
         Duration::from_secs(5),
         onday::Backoff::FAST,
-        |_| {},
     )
     .await;
     let console = page.console_messages(0).await?;
@@ -508,7 +507,6 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run one step of a test, failing with its name instead of hanging.
 /// `goto` settles on wherever a redirect lands, not on the URL it was given.
 async fn redirects(page: &Page, base: &str) -> Result<()> {
     for path in ["/redirect", "/redirect-remote", "/script-redirect"] {
@@ -546,9 +544,91 @@ async fn redirects(page: &Page, base: &str) -> Result<()> {
         landed.ends_with("#below"),
         "the fragment landed on {landed}"
     );
+    // A navigation that never commits fails at once instead of waiting out the timeout,
+    // both refused by the server and blocked by the browser, which Chromium over
+    // Classic reports as done while showing its error page.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind a port to release")?
+        .local_addr()
+        .context("released port address")?;
+    for unreachable in [
+        format!("http://{closed}/"),
+        "http://127.0.0.1:1/".to_string(),
+    ] {
+        let started = std::time::Instant::now();
+        let navigated = page.goto(&unreachable, WaitUntil::Load).await;
+        ensure!(navigated.is_err(), "navigating to {unreachable} succeeded");
+        ensure!(
+            started.elapsed() < Duration::from_secs(5),
+            "navigating to {unreachable} took {:?} to fail",
+            started.elapsed()
+        );
+    }
     Ok(())
 }
 
+/// `WebDriverExt::type_into_selector` acts like a person and checks what the field holds.
+async fn typing(page: &Page) -> Result<()> {
+    let driver = page.driver();
+    let timeout = Duration::from_secs(10);
+    // A label covering the input forwards the pointer click's focus to it.
+    driver.type_into_selector("#float", "new", timeout).await?;
+    expect(&page.locator("#float")).to_have_value("new").await?;
+    driver
+        .type_into_selector("#wrapped", "Grace", timeout)
+        .await?;
+    expect(&page.locator("#wrapped"))
+        .to_have_value("Grace")
+        .await?;
+    // A mask reformats both the prefill and the typed digits.
+    driver
+        .type_into_selector("#phone", "5551234567", timeout)
+        .await?;
+    expect(&page.locator("#phone"))
+        .to_have_value("(555) 123-4567")
+        .await?;
+    // One input event for the clear, one per typed key.
+    driver.type_into_selector("#search", "ab", timeout).await?;
+    expect(&page.locator("#search")).to_have_value("ab").await?;
+    let inputs: u32 = page.evaluate("window.__searchInputs").await?;
+    ensure!(inputs == 3, "#search saw {inputs} input events, expected 3");
+    driver.type_into_selector("#qty", "40", timeout).await?;
+    expect(&page.locator("#qty")).to_have_value("40").await?;
+    driver
+        .type_into_selector("#notes", "only line", timeout)
+        .await?;
+    expect(&page.locator("#notes"))
+        .to_have_value("only line")
+        .await?;
+    driver
+        .type_into_selector("#editor", "typed", timeout)
+        .await?;
+    expect(&page.locator("#editor"))
+        .to_have_text("typed")
+        .await?;
+    let covered = driver
+        .type_into_selector("#covered", "x", timeout)
+        .await
+        .err()
+        .context("typing into a field under a toast should fail")?;
+    ensure!(
+        format!("{covered:#}").contains(r#"id="toast""#),
+        "the focus error should name the toast: {covered:#}"
+    );
+    let dated = driver
+        .type_into_selector("#when", "10012026", timeout)
+        .await
+        .err()
+        .context("typing into a date input should fail")?;
+    ensure!(
+        format!("{dated:#}").contains("text typing does not apply"),
+        "the date refusal should say typing does not apply: {dated:#}"
+    );
+    Ok(())
+}
+
+/// Run one step of a test, failing with its name instead of hanging.
 async fn step<T>(what: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
     let started = std::time::Instant::now();
     tracing::info!("step: {what}");

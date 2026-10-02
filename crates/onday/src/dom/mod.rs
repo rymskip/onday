@@ -1,12 +1,14 @@
 //! Polling, selector and click helpers on a raw `thirtyfour::WebDriver` (Classic).
 //!
 //! Click modes:
-//! - `click_*`: W3C Actions (pointer move + click), matching real input; the default.
+//! - `click_*`: WebDriver element click, retried while the driver reports it
+//!   intercepted, stale or not interactable; the default.
 //! - `js_click_*`: `HTMLElement.click()`, for targets whose ancestors swallow pointer events.
 //! - `dispatch_pointer_click`: synthetic `pointerdown`/`pointerup`/`click`, for
 //!   triggers that open on `pointerdown`.
 
 mod impls;
+mod runtime;
 mod wait;
 
 use anyhow::Result;
@@ -52,7 +54,7 @@ pub trait WebDriverExt {
         timeout: Duration,
     ) -> impl Future<Output = Result<WebElement>>;
 
-    /// Click through the W3C Actions API once the element has settled.
+    /// WebDriver element click once the element has settled, retried while transient.
     fn click_selector(&self, selector: &str, timeout: Duration)
     -> impl Future<Output = Result<()>>;
 
@@ -95,7 +97,11 @@ pub trait WebDriverExt {
         timeout: Duration,
     ) -> impl Future<Output = Result<()>>;
 
-    /// Focus the element, clear it, then type `text`.
+    /// Type `text` into an input, textarea or contenteditable the way a person does:
+    /// pointer click at its center, confirm focus landed there, clear with the
+    /// browser's select-all and one Backspace, type, then require every typed
+    /// character in the field in order, so masks pass.
+    /// Native-picker and valueless input types are refused.
     fn type_into_testid(
         &self,
         testid: &str,
@@ -114,4 +120,48 @@ pub trait WebDriverExt {
 /// Escape a string for a single-quoted JS string literal.
 fn escape_js_single(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Whether every typed character appears in `landed`, in order. A mask's own
+/// separators may sit between them; WebDriver key codepoints are keys, not text.
+fn typed_in_order(typed: &str, landed: &str) -> bool {
+    let mut remaining = landed.chars();
+    typed
+        .chars()
+        .filter(|character| !('\u{e000}'..='\u{f8ff}').contains(character))
+        .all(|character| remaining.any(|held| held == character))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::typed_in_order;
+    use thirtyfour::prelude::Key;
+
+    #[test]
+    fn exact_text_is_in_order() {
+        assert!(typed_in_order("hello", "hello"));
+        assert!(typed_in_order("", ""));
+    }
+
+    #[test]
+    fn mask_separators_are_tolerated() {
+        assert!(typed_in_order("5551234567", "(555) 123-4567"));
+        assert!(typed_in_order("1234.5", "1,234.50"));
+    }
+
+    #[test]
+    fn a_dropped_character_fails() {
+        assert!(!typed_in_order("5551234567", "(555) 123-456"));
+    }
+
+    #[test]
+    fn a_reordered_value_fails() {
+        assert!(!typed_in_order("abc", "acb"));
+    }
+
+    #[test]
+    fn key_codepoints_are_skipped() {
+        let typed = format!("ab{}", char::from(Key::Tab));
+        assert!(typed_in_order(&typed, "ab"));
+    }
 }
