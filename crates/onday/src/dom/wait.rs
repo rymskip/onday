@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thirtyfour::prelude::*;
 
-use crate::js;
+use super::runtime::call_lib;
 use crate::poll::{Backoff, poll_until};
 
 #[derive(Debug, Deserialize)]
@@ -27,24 +27,9 @@ const PROBE: &str = "(lib, selector, hover) => {
 async fn probe(driver: &WebDriver, selector: &str, hover: Option<&str>) -> Result<Probe> {
     let hover = serde_json::to_value(hover).context("serialize hover selector")?;
     let selector = serde_json::to_value(selector).context("serialize selector")?;
-    let body = js::classic_body(&js::json_call(PROBE, ""));
-    let run = || async {
-        driver
-            .execute(body.clone(), vec![selector.clone(), hover.clone()])
-            .await
-            .context("run the interactability probe")?
-            .convert::<String>()
-            .context("read the probe result")
-    };
-    let mut text = run().await?;
-    if text == js::RUNTIME_MISSING {
-        driver
-            .execute(js::classic_body(&js::install_call()), Vec::new())
-            .await
-            .context("install the page runtime")?;
-        text = run().await?;
-    }
-    serde_json::from_str(&text).with_context(|| format!("decode probe result {text}"))
+    call_lib(driver, PROBE, vec![selector, hover])
+        .await
+        .context("run the interactability probe")
 }
 
 /// Poll until the element is settled: sized, visible, opaque (outside the hooks'
@@ -85,7 +70,6 @@ pub async fn wait_until_interactable(
         },
         timeout,
         Backoff::FAST,
-        |_| {},
     )
     .await;
     if interactable {

@@ -461,6 +461,9 @@ impl Page {
                     .await
                     .with_context(|| format!("navigate to {url}"))?;
                 drop(window);
+                self.fail_on_error_page()
+                    .await
+                    .with_context(|| format!("navigate to {url}"))?;
             }
         }
         if let Some(script) = ready {
@@ -502,6 +505,23 @@ impl Page {
         Ok(())
     }
 
+    /// Chromium over Classic reports a failed navigation as done and shows its own
+    /// error page instead, so a document on that page is the failure.
+    async fn fail_on_error_page(&self) -> Result<()> {
+        let code: Option<String> = self
+            .evaluate(
+                "document.URL.startsWith('chrome-error://') \
+                 ? ((document.querySelector('.error-code') || {}).textContent || 'no error code') \
+                 : null",
+            )
+            .await
+            .context("check for the browser's error page")?;
+        match code {
+            Some(code) => bail!("the browser showed its error page: {code}"),
+            None => Ok(()),
+        }
+    }
+
     /// Mark the current document so a readiness poll cannot read it after navigation starts.
     async fn stamp_navigation(&self) {
         let stamped = self
@@ -520,7 +540,6 @@ impl Page {
             || async { self.evaluate::<bool>(&guarded).await.unwrap_or(false) },
             timeout,
             Backoff::FAST,
-            |_| {},
         )
         .await;
         if !held {
@@ -551,6 +570,7 @@ impl Page {
                 let window = self.classic_window().await?;
                 self.driver().refresh().await.context("reload")?;
                 drop(window);
+                self.fail_on_error_page().await.context("reload")?;
             }
         }
         Ok(())
@@ -636,7 +656,6 @@ impl Page {
             },
             timeout,
             Backoff::FAST,
-            |_| {},
         )
         .await;
         if matched {
@@ -681,7 +700,6 @@ impl Page {
             || async { self.evaluate::<bool>(&check).await.unwrap_or(false) },
             timeout,
             Backoff::FAST,
-            |_| {},
         )
         .await;
         if !held {

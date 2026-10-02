@@ -792,6 +792,38 @@
     // Inputs whose UI does not accept typed characters take their value directly.
     const DIRECT_TYPES = new Set(['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range']);
 
+    // Inputs that take no typed text: their own pickers and segment order, or no text value at all.
+    const NON_TEXT_TYPES = new Set([...DIRECT_TYPES, 'file', 'checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'hidden']);
+
+    // What typing into `el` would edit, its current text, and whether it holds focus.
+    function typingState(el) {
+        const tag = el.tagName;
+        const type = tag === 'INPUT' ? (el.type || 'text').toLowerCase() : null;
+        let kind = 'other';
+        let text = '';
+        if (tag === 'INPUT') {
+            kind = NON_TEXT_TYPES.has(type) ? 'native' : 'input';
+            text = el.value;
+        } else if (tag === 'TEXTAREA') {
+            kind = 'textarea';
+            text = el.value;
+        } else if (el.isContentEditable) {
+            kind = 'editable';
+            // An emptied editable keeps a placeholder <br>, which reads as one newline.
+            text = el.innerText.replace(/\n$/, '');
+        }
+        const r = el.getBoundingClientRect();
+        const onTop = deepHit(document, r.left + r.width / 2, r.top + r.height / 2);
+        return {
+            kind,
+            type,
+            text,
+            focused: document.activeElement === el,
+            onTop: describe(onTop),
+            active: describe(document.activeElement),
+        };
+    }
+
     function fillDirect(el, value) {
         if (el.tagName !== 'INPUT' || !DIRECT_TYPES.has((el.type || '').toLowerCase())) return false;
         el.focus();
@@ -940,6 +972,7 @@
         endDrag,
         clearForTyping,
         fillDirect,
+        typingState,
         selectOptions,
         info,
         describe,

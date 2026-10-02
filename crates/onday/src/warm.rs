@@ -31,11 +31,17 @@ where
     F: FnMut(Duration),
 {
     let start = Instant::now();
-    let held = crate::poll::poll_until(
+    let held = crate::poll::poll_until_reporting(
         || async {
             match driver.execute(ready_script, Vec::new()).await {
-                Ok(returned) => returned.convert::<bool>().unwrap_or(false),
-                Err(_) => false,
+                Ok(returned) => returned.convert::<bool>().unwrap_or_else(|error| {
+                    tracing::debug!("ready predicate returned a non-boolean: {error:#}");
+                    false
+                }),
+                Err(error) => {
+                    tracing::debug!("ready predicate failed: {error:#}");
+                    false
+                }
             }
         },
         timeout,
