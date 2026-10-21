@@ -14,14 +14,22 @@ use onday::{
     Page, Protocol, ProtocolPreference, RouteAction, ScreenshotOptions, WaitUntil,
 };
 use rmcp::{
-    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, tool,
-    tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
 };
 use serde_json::value::RawValue;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::params::*;
+use crate::params::{
+    ButtonParam, ClickParams, ConsoleParams, DialogParams, DragParams, EngineParam, EvaluateParams,
+    FieldKind, FillFormParams, LaunchParams, NavigateParams, NetworkParams, PressKeyParams,
+    ResizeParams, RouteKind, RouteParams, ScreenshotParams, SelectParams, SnapshotParams,
+    TabAction, TabsParams, TargetOnlyParams, TargetParams, TypeParams, UnrouteParams, UploadParams,
+    WaitParams,
+};
 use crate::session::{Session, SessionDir};
 
 const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, WebDriver Classic fallback).
@@ -253,17 +261,21 @@ impl OndayServer {
         let running = state.running.as_mut().context("no browser")?;
         let dir = self.session.dir().await?;
         let pages = running.context.pages().await?;
-        if pages.is_empty() {
+        let Some(last) = pages.last() else {
             let page = running.context.new_page().await?;
             page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
             running.current = 0;
             Self::stream_logs(&dir, running, &page);
             return Ok(page);
-        }
-        if running.current >= pages.len() {
-            running.current = pages.len() - 1;
-        }
-        let page = pages[running.current].clone();
+        };
+        // The tab the session was on may have closed; the last one takes its place.
+        let page = match pages.get(running.current) {
+            Some(page) => page.clone(),
+            None => {
+                running.current = pages.len().saturating_sub(1);
+                last.clone()
+            }
+        };
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
         Self::stream_logs(&dir, running, &page);
         Ok(page)
@@ -385,7 +397,7 @@ impl OndayServer {
     )]
     async fn browser_launch(
         &self,
-        Parameters(p): Parameters<LaunchParams>,
+        Parameters(params): Parameters<LaunchParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let mut state = self.state.lock().await;
@@ -397,7 +409,7 @@ impl OndayServer {
                     .context("close the running browser")?;
             }
             let current = state.settings.clone();
-            let engine = match p.engine {
+            let engine = match params.engine {
                 Some(EngineParam::Chromium) => Engine::Chromium,
                 Some(EngineParam::Firefox) => Engine::Firefox,
                 Some(EngineParam::Webkit) => Engine::Webkit,
@@ -405,17 +417,17 @@ impl OndayServer {
             };
             let settings = LaunchSettings {
                 engine,
-                headless: p.headless.unwrap_or(current.headless),
+                headless: params.headless.unwrap_or(current.headless),
                 viewport: (
-                    p.width.unwrap_or(current.viewport.0),
-                    p.height.unwrap_or(current.viewport.1),
+                    params.width.unwrap_or(current.viewport.0),
+                    params.height.unwrap_or(current.viewport.1),
                 ),
-                executable: match p.executable_path {
+                executable: match params.executable_path {
                     Some(path) => Some(path.into()),
                     None if engine == current.engine => current.executable,
                     None => None,
                 },
-                classic: p.classic.unwrap_or(current.classic),
+                classic: params.classic.unwrap_or(current.classic),
             };
             let running = self.launch(&settings).await?;
             let summary = format!("Launched {settings} over {}", running.browser.protocol());
@@ -498,11 +510,11 @@ impl OndayServer {
     )]
     async fn browser_navigate(
         &self,
-        Parameters(p): Parameters<NavigateParams>,
+        Parameters(params): Parameters<NavigateParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                page.goto(&p.url, WaitUntil::Load).await?;
+                page.goto(&params.url, WaitUntil::Load).await?;
                 Ok(String::new())
             })
             .await,
@@ -558,11 +570,11 @@ impl OndayServer {
     )]
     async fn browser_snapshot(
         &self,
-        Parameters(p): Parameters<SnapshotParams>,
+        Parameters(params): Parameters<SnapshotParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
-            match p.reference {
+            match params.reference {
                 None => self.report(&page, true).await,
                 Some(reference) => {
                     let tree = page.get_by_ref(&reference).snapshot().await?;
@@ -580,24 +592,24 @@ impl OndayServer {
     )]
     async fn browser_click(
         &self,
-        Parameters(p): Parameters<ClickParams>,
+        Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                let locator = Self::locate(&page, &p.target)?;
+                let locator = Self::locate(&page, &params.target)?;
                 locator
                     .click_with(ClickOptions {
-                        button: match p.button {
+                        button: match params.button {
                             ButtonParam::Left => MouseButton::Left,
                             ButtonParam::Middle => MouseButton::Middle,
                             ButtonParam::Right => MouseButton::Right,
                         },
-                        click_count: if p.double_click { 2 } else { 1 },
-                        modifiers: p.modifiers,
+                        click_count: if params.double_click { 2 } else { 1 },
+                        modifiers: params.modifiers,
                         ..ClickOptions::default()
                     })
                     .await?;
-                Ok(format!("Clicked {}", describe(&p.target)))
+                Ok(format!("Clicked {}", describe(&params.target)))
             })
             .await,
         )
@@ -610,12 +622,12 @@ impl OndayServer {
     )]
     async fn browser_hover(
         &self,
-        Parameters(p): Parameters<TargetOnlyParams>,
+        Parameters(params): Parameters<TargetOnlyParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                Self::locate(&page, &p.target)?.hover().await?;
-                Ok(format!("Hovered {}", describe(&p.target)))
+                Self::locate(&page, &params.target)?.hover().await?;
+                Ok(format!("Hovered {}", describe(&params.target)))
             })
             .await,
         )
@@ -628,20 +640,20 @@ impl OndayServer {
     )]
     async fn browser_type(
         &self,
-        Parameters(p): Parameters<TypeParams>,
+        Parameters(params): Parameters<TypeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                let locator = Self::locate(&page, &p.target)?;
-                if p.slowly {
-                    locator.press_sequentially(&p.text).await?;
+                let locator = Self::locate(&page, &params.target)?;
+                if params.slowly {
+                    locator.press_sequentially(&params.text).await?;
                 } else {
-                    locator.fill(&p.text).await?;
+                    locator.fill(&params.text).await?;
                 }
-                if p.submit {
+                if params.submit {
                     locator.press("Enter").await?;
                 }
-                Ok(format!("Typed into {}", describe(&p.target)))
+                Ok(format!("Typed into {}", describe(&params.target)))
             })
             .await,
         )
@@ -654,11 +666,11 @@ impl OndayServer {
     )]
     async fn browser_fill_form(
         &self,
-        Parameters(p): Parameters<FillFormParams>,
+        Parameters(params): Parameters<FillFormParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                for field in &p.fields {
+                for field in &params.fields {
                     let locator = Self::locate(&page, &field.target)?;
                     match field.kind {
                         Some(FieldKind::Checkbox) | Some(FieldKind::Radio) => {
@@ -673,7 +685,7 @@ impl OndayServer {
                         _ => locator.fill(&field.value).await?,
                     }
                 }
-                Ok(format!("Filled {} field(s)", p.fields.len()))
+                Ok(format!("Filled {} field(s)", params.fields.len()))
             })
             .await,
         )
@@ -686,12 +698,12 @@ impl OndayServer {
     )]
     async fn browser_select_option(
         &self,
-        Parameters(p): Parameters<SelectParams>,
+        Parameters(params): Parameters<SelectParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                let values: Vec<&str> = p.values.iter().map(String::as_str).collect();
-                let chosen = Self::locate(&page, &p.target)?
+                let values: Vec<&str> = params.values.iter().map(String::as_str).collect();
+                let chosen = Self::locate(&page, &params.target)?
                     .select_option(&values)
                     .await?;
                 Ok(format!("Selected {chosen:?}"))
@@ -707,12 +719,12 @@ impl OndayServer {
     )]
     async fn browser_press_key(
         &self,
-        Parameters(p): Parameters<PressKeyParams>,
+        Parameters(params): Parameters<PressKeyParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                page.keyboard().press(&p.key).await?;
-                Ok(format!("Pressed {}", p.key))
+                page.keyboard().press(&params.key).await?;
+                Ok(format!("Pressed {}", params.key))
             })
             .await,
         )
@@ -725,23 +737,23 @@ impl OndayServer {
     )]
     async fn browser_drag(
         &self,
-        Parameters(p): Parameters<DragParams>,
+        Parameters(params): Parameters<DragParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
                 let start = Self::locate(
                     &page,
                     &TargetParams {
-                        reference: p.start_ref,
-                        selector: p.start_selector,
+                        reference: params.start_ref,
+                        selector: params.start_selector,
                         element: None,
                     },
                 )?;
                 let end = Self::locate(
                     &page,
                     &TargetParams {
-                        reference: p.end_ref,
-                        selector: p.end_selector,
+                        reference: params.end_ref,
+                        selector: params.end_selector,
                         element: None,
                     },
                 )?;
@@ -763,16 +775,16 @@ impl OndayServer {
     )]
     async fn browser_file_upload(
         &self,
-        Parameters(p): Parameters<UploadParams>,
+        Parameters(params): Parameters<UploadParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                let locator = match (&p.target.reference, &p.target.selector) {
+                let locator = match (&params.target.reference, &params.target.selector) {
                     (None, None) => page.locator("input[type=file]"),
-                    _ => Self::locate(&page, &p.target)?,
+                    _ => Self::locate(&page, &params.target)?,
                 };
-                locator.set_input_files(&p.paths).await?;
-                Ok(format!("Attached {} file(s)", p.paths.len()))
+                locator.set_input_files(&params.paths).await?;
+                Ok(format!("Attached {} file(s)", params.paths.len()))
             })
             .await,
         )
@@ -785,12 +797,13 @@ impl OndayServer {
     )]
     async fn browser_handle_dialog(
         &self,
-        Parameters(p): Parameters<DialogParams>,
+        Parameters(params): Parameters<DialogParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                page.handle_dialog(p.accept, p.prompt_text).await?;
-                Ok(if p.accept {
+                page.handle_dialog(params.accept, params.prompt_text)
+                    .await?;
+                Ok(if params.accept {
                     "Accepted the dialog".to_string()
                 } else {
                     "Dismissed the dialog".to_string()
@@ -807,30 +820,33 @@ impl OndayServer {
     )]
     async fn browser_wait_for(
         &self,
-        Parameters(p): Parameters<WaitParams>,
+        Parameters(params): Parameters<WaitParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                let timeout = Duration::from_secs_f64(p.timeout.unwrap_or(30.0));
-                if let Some(seconds) = p.time {
+                let timeout = Duration::from_secs_f64(params.timeout.unwrap_or(30.0));
+                if let Some(seconds) = params.time {
                     tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
                 }
-                if let Some(text) = &p.text {
+                if let Some(text) = &params.text {
                     page.get_by_text(text)
                         .first()
-                        .wait_for(ElementState::Visible, timeout)
+                        .with_timeout(timeout)
+                        .wait_for(ElementState::Visible)
                         .await?;
                 }
-                if let Some(text) = &p.text_gone {
+                if let Some(text) = &params.text_gone {
                     page.get_by_text(text)
                         .first()
-                        .wait_for(ElementState::Hidden, timeout)
+                        .with_timeout(timeout)
+                        .wait_for(ElementState::Hidden)
                         .await?;
                 }
-                if let Some(selector) = &p.selector {
+                if let Some(selector) = &params.selector {
                     page.locator(selector.clone())
                         .first()
-                        .wait_for(ElementState::Visible, timeout)
+                        .with_timeout(timeout)
+                        .wait_for(ElementState::Visible)
                         .await?;
                 }
                 Ok("Waited".to_string())
@@ -846,13 +862,17 @@ impl OndayServer {
     )]
     async fn browser_evaluate(
         &self,
-        Parameters(p): Parameters<EvaluateParams>,
+        Parameters(params): Parameters<EvaluateParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
-            let result: Box<RawValue> = match (&p.target.reference, &p.target.selector) {
-                (None, None) => page.evaluate(&p.function).await?,
-                _ => Self::locate(&page, &p.target)?.eval_on(&p.function).await?,
+            let result: Box<RawValue> = match (&params.target.reference, &params.target.selector) {
+                (None, None) => page.evaluate(&params.function).await?,
+                _ => {
+                    Self::locate(&page, &params.target)?
+                        .eval_on(&params.function)
+                        .await?
+                }
             };
             Ok(format!("```json\n{}\n```", result.get()))
         }
@@ -866,20 +886,20 @@ impl OndayServer {
     )]
     async fn browser_take_screenshot(
         &self,
-        Parameters(p): Parameters<ScreenshotParams>,
+        Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
-            let png = match (&p.target.reference, &p.target.selector) {
+            let png = match (&params.target.reference, &params.target.selector) {
                 (None, None) => {
                     page.screenshot(ScreenshotOptions {
-                        full_page: p.full_page,
+                        full_page: params.full_page,
                     })
                     .await?
                 }
-                _ => Self::locate(&page, &p.target)?.screenshot().await?,
+                _ => Self::locate(&page, &params.target)?.screenshot().await?,
             };
-            let name = match p.filename {
+            let name = match params.filename {
                 Some(name) => sanitize_filename(&name)?,
                 None => format!("{}.png", timestamp_millis()),
             };
@@ -906,15 +926,16 @@ impl OndayServer {
     )]
     async fn browser_console_messages(
         &self,
-        Parameters(p): Parameters<ConsoleParams>,
+        Parameters(params): Parameters<ConsoleParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
-            let floor = level_rank(p.level.as_deref().unwrap_or("debug"));
+            let floor = level_rank(params.level.as_deref().unwrap_or("debug"));
             let mut out = String::new();
             for message in page.console_messages(0).await? {
                 let wanted = level_rank(&message.level) >= floor
-                    && p.filter
+                    && params
+                        .filter
                         .as_deref()
                         .is_none_or(|filter| message.text.contains(filter));
                 if wanted {
@@ -942,13 +963,14 @@ impl OndayServer {
     )]
     async fn browser_network_requests(
         &self,
-        Parameters(p): Parameters<NetworkParams>,
+        Parameters(params): Parameters<NetworkParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
             let mut out = String::new();
             for entry in page.network_requests(0).await? {
-                if p.filter
+                if params
+                    .filter
                     .as_deref()
                     .is_some_and(|filter| !entry.url.contains(filter))
                 {
@@ -956,7 +978,7 @@ impl OndayServer {
                 }
                 let failed =
                     entry.error.is_some() || entry.status.is_some_and(|status| status >= 400);
-                if p.failures_only && !failed {
+                if params.failures_only && !failed {
                     continue;
                 }
                 let outcome = match (&entry.status, &entry.error) {
@@ -964,13 +986,16 @@ impl OndayServer {
                     (None, Some(error)) => format!("FAILED {error}"),
                     (None, None) => "pending".to_string(),
                 };
-                let duration = entry
-                    .duration_ms
-                    .map(|ms| format!(" {ms}ms"))
-                    .unwrap_or_default();
-                writeln!(out, "{} {} -> {outcome}{duration}", entry.method, entry.url)
-                    .context("format")?;
-                if p.headers {
+                writeln!(
+                    out,
+                    "{} {} {} -> {outcome}{}",
+                    entry.started,
+                    entry.method,
+                    entry.url,
+                    crate::session::settled_note(&entry)
+                )
+                .context("format")?;
+                if params.headers {
                     for header in &entry.request_headers {
                         writeln!(out, "    > {}: {}", header.name, header.value)
                             .context("format")?;
@@ -997,25 +1022,25 @@ impl OndayServer {
     )]
     async fn browser_route(
         &self,
-        Parameters(p): Parameters<RouteParams>,
+        Parameters(params): Parameters<RouteParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             let page = self.page().await?;
-            let action = match p.action {
+            let action = match params.action {
                 RouteKind::Block => RouteAction::Abort,
                 RouteKind::Continue => RouteAction::Continue,
                 RouteKind::Fulfill => RouteAction::Fulfill(Fulfill::new(
-                    p.status.unwrap_or(200),
-                    p.content_type.as_deref().unwrap_or("application/json"),
-                    p.body.clone().unwrap_or_default(),
+                    params.status.unwrap_or(200),
+                    params.content_type.as_deref().unwrap_or("application/json"),
+                    params.body.clone().unwrap_or_default(),
                 )),
             };
             let handler = move |request: &InterceptedRequest| {
                 tracing::debug!("route answered {} {}", request.method, request.url);
                 action.clone()
             };
-            page.route(&p.pattern, Arc::new(handler)).await?;
-            Ok(format!("Routing {}", p.pattern))
+            page.route(&params.pattern, Arc::new(handler)).await?;
+            Ok(format!("Routing {}", params.pattern))
         }
         .await;
         self.reply(outcome).await
@@ -1027,11 +1052,11 @@ impl OndayServer {
     )]
     async fn browser_unroute(
         &self,
-        Parameters(p): Parameters<UnrouteParams>,
+        Parameters(params): Parameters<UnrouteParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
-            self.page().await?.unroute(&p.pattern).await?;
-            Ok(format!("Removed route {}", p.pattern))
+            self.page().await?.unroute(&params.pattern).await?;
+            Ok(format!("Removed route {}", params.pattern))
         }
         .await;
         self.reply(outcome).await
@@ -1043,17 +1068,17 @@ impl OndayServer {
     )]
     async fn browser_tabs(
         &self,
-        Parameters(p): Parameters<TabsParams>,
+        Parameters(params): Parameters<TabsParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
             self.page().await?;
             let mut state = self.state.lock().await;
             let running = state.running.as_mut().context("no browser")?;
-            match p.action {
+            match params.action {
                 TabAction::List => {}
                 TabAction::New => {
                     let page = running.context.new_page().await?;
-                    if let Some(url) = &p.url {
+                    if let Some(url) = &params.url {
                         page.goto(url, WaitUntil::Load).await?;
                     }
                     running.current = running.context.pages().await?.len().saturating_sub(1);
@@ -1061,7 +1086,7 @@ impl OndayServer {
                     running.network_seen = 0;
                 }
                 TabAction::Select => {
-                    let index = p.index.context("select needs an index")?;
+                    let index = params.index.context("select needs an index")?;
                     let pages = running.context.pages().await?;
                     let page = pages
                         .get(index)
@@ -1077,13 +1102,13 @@ impl OndayServer {
                 }
                 TabAction::Close => {
                     let pages = running.context.pages().await?;
-                    let index = p.index.unwrap_or(running.current);
+                    let index = params.index.unwrap_or(running.current);
                     let page = pages
                         .get(index)
                         .with_context(|| format!("no tab {index}"))?;
                     page.close().await?;
                     if running.current >= index && running.current > 0 {
-                        running.current -= 1;
+                        running.current = running.current.saturating_sub(1);
                     }
                 }
             }
@@ -1105,12 +1130,12 @@ impl OndayServer {
     #[tool(name = "browser_resize", description = "Resize the viewport.")]
     async fn browser_resize(
         &self,
-        Parameters(p): Parameters<ResizeParams>,
+        Parameters(params): Parameters<ResizeParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reply(
             self.act(|page| async move {
-                page.set_viewport(p.width, p.height).await?;
-                Ok(format!("Viewport is {}x{}", p.width, p.height))
+                page.set_viewport(params.width, params.height).await?;
+                Ok(format!("Viewport is {}x{}", params.width, params.height))
             })
             .await,
         )
@@ -1168,9 +1193,9 @@ fn level_rank(level: &str) -> u8 {
 fn sanitize_filename(name: &str) -> Result<String> {
     let valid = !name.is_empty()
         && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
     if !valid {
         bail!("screenshot filename {name:?} must be letters, digits, '-', '_' or '.'");
     }

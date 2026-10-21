@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -11,8 +11,9 @@ use crate::keys::parse_chord;
 use crate::page::{
     Anchor, ClickPoint, ElementRef, Hit, JsArg, MouseButton, Page, Resolution, abbreviate, quote,
 };
-use crate::poll::Backoff;
+use crate::poll::{Backoff, poll_until_ok};
 use crate::proto::{KeyAction, PointerAction};
+use crate::typing::{TypingState, typed_in_order};
 
 /// Options for [`Locator::click_with`].
 #[derive(Debug, Clone, Default)]
@@ -34,6 +35,15 @@ pub enum ElementState {
     Detached,
     Visible,
     Hidden,
+}
+
+/// An element's box in its frame's viewport, in whole CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct BoundingBox {
+    pub left: i64,
+    pub top: i64,
+    pub width: i64,
+    pub height: i64,
 }
 
 /// What the page runtime reports about one element.
@@ -59,6 +69,32 @@ struct Probe {
     rect: Option<[f64; 4]>,
 }
 
+/// Whether the browser ran a drag of its own, by its trusted events.
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct NativeDrag {
+    started: bool,
+    ended: bool,
+}
+
+impl NativeDrag {
+    fn describe(self) -> &'static str {
+        if self.started {
+            "a native drag started and had not ended 500ms after the release"
+        } else {
+            "no native drag started"
+        }
+    }
+}
+
+/// What a drop fired in the target's page came to.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DropOutcome {
+    effect: String,
+    /// What lay under the point and refused the drop, when it was refused.
+    refused_by: Option<String>,
+}
+
 /// What firing `dragstart` in the source's page produced.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,34 +104,12 @@ struct DragStart {
     effect_allowed: String,
 }
 
-/// Pointer moves in a drag, spread over this many animation frames.
-const DRAG_STEPS: i64 = 10;
-
-fn pointer_move((x, y): (i64, i64), duration: Option<u64>) -> PointerAction {
-    PointerAction::PointerMove {
-        x,
-        y,
-        duration,
+fn pointer_move((horizontal, vertical): (i64, i64)) -> PointerAction {
+    PointerAction::Move {
+        horizontal,
+        vertical,
         origin: "viewport",
     }
-}
-
-/// Moves along the straight line from `from` to `to`, at the given steps out of
-/// [`DRAG_STEPS`].
-fn glide(
-    from: (i64, i64),
-    to: (i64, i64),
-    steps: impl Iterator<Item = i64>,
-) -> impl Iterator<Item = PointerAction> {
-    steps.map(move |step| {
-        pointer_move(
-            (
-                from.0 + (to.0 - from.0) * step / DRAG_STEPS,
-                from.1 + (to.1 - from.1) * step / DRAG_STEPS,
-            ),
-            Some(16),
-        )
-    })
 }
 
 /// An actionable element and its centre, in its own frame's viewport and in the
@@ -110,8 +124,8 @@ impl Aim {
     fn anchor(&self) -> Anchor<'_> {
         Anchor {
             element: &self.element,
-            x: self.local.0,
-            y: self.local.1,
+            horizontal: self.local.0,
+            vertical: self.local.1,
         }
     }
 }
@@ -122,6 +136,97 @@ enum Pending {
     Moving(String),
     /// Something else stands in the way.
     Blocked(String),
+}
+
+/// Where each attempt scrolls its target, in turn, as Playwright's retries do:
+/// first only as far as it is out of view (`None`), then forced to end, centre
+/// and start, which is how a sticky bar over the target is cleared. Leaving a
+/// visible target where it is keeps it under a pointer that revealed it.
+const SCROLL_ALIGNMENTS: [Option<&str>; 4] = [None, Some("end"), Some("center"), Some("start")];
+
+/// The alignment for attempt `turn`, as the argument `lib.scrollAligned` reads.
+fn alignment(turn: usize) -> JsArg {
+    match SCROLL_ALIGNMENTS
+        .iter()
+        .cycle()
+        .nth(turn)
+        .copied()
+        .flatten()
+    {
+        Some(block) => JsArg::Str(block.to_string()),
+        None => JsArg::Null,
+    }
+}
+
+/// Playwright's waits before a pointer action's second, third and later attempts.
+const RETRY_WAITS: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_millis(20),
+    Duration::from_millis(100),
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+];
+
+/// Which of a pointer action's events the page guards, as Playwright's
+/// hit-target interceptor kinds.
+#[derive(Debug, Clone, Copy)]
+enum Guard {
+    Hover,
+    Mouse,
+    /// Only the aimed point is checked: the dragged element often stays under
+    /// the cursor through the drop.
+    Drop,
+}
+
+impl Guard {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Hover => "hover",
+            Self::Mouse => "mouse",
+            Self::Drop => "drag",
+        }
+    }
+}
+
+/// A pointer action as Playwright's `_retryPointerAction` takes it.
+#[derive(Debug, Clone, Copy)]
+struct Pointer {
+    /// Whether the target must also be enabled and not inert.
+    enabled: bool,
+    force: bool,
+    guard: Guard,
+    /// Whether a hit on the label bound to the target counts: onday's typing
+    /// click only, with no Playwright counterpart.
+    follow_label: bool,
+}
+
+/// Why a pointer action's attempts were abandoned, each reason once and in
+/// order, as Playwright's call log reports them when the action times out.
+#[derive(Debug, Default)]
+struct AttemptLog(Vec<String>);
+
+impl AttemptLog {
+    fn record(&mut self, why: String) {
+        if !self.0.contains(&why) {
+            self.0.push(why);
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return formatter.write_str("not attempted");
+        }
+        formatter.write_str(&self.0.join("; "))
+    }
+}
+
+/// One attempt at a pointer action, up to its input.
+enum Attempt {
+    Aimed(Aim),
+    /// Why the attempt was abandoned; the action retries.
+    Retry(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,11 +241,27 @@ struct Checks {
 pub struct Locator {
     page: Page,
     selector: String,
+    /// How long this locator's actions and waits may take, when not the page's default.
+    timeout: Option<Duration>,
 }
 
 impl Locator {
     pub(crate) fn new(page: Page, selector: String) -> Locator {
-        Locator { page, selector }
+        Locator {
+            page,
+            selector,
+            timeout: None,
+        }
+    }
+
+    /// The same locator with `timeout` as the budget of its actions and waits,
+    /// in place of the page's default. Locators refined from it keep it.
+    pub fn with_timeout(&self, timeout: Duration) -> Locator {
+        Locator {
+            page: self.page.clone(),
+            selector: self.selector.clone(),
+            timeout: Some(timeout),
+        }
     }
 
     pub fn selector(&self) -> &str {
@@ -155,10 +276,11 @@ impl Locator {
 
     /// Descendants of this locator's elements matching `selector`.
     pub fn locator(&self, selector: &str) -> Locator {
-        Locator::new(
-            self.page.clone(),
-            format!("{} >> {selector}", self.selector),
-        )
+        Locator {
+            page: self.page.clone(),
+            selector: format!("{} >> {selector}", self.selector),
+            timeout: self.timeout,
+        }
     }
 
     pub fn nth(&self, index: i64) -> Locator {
@@ -290,7 +412,9 @@ impl Locator {
     }
 
     fn timeout(&self, explicit: Option<Duration>) -> Duration {
-        explicit.unwrap_or_else(|| self.page.default_timeout())
+        explicit
+            .or(self.timeout)
+            .unwrap_or_else(|| self.page.default_timeout())
     }
 
     /// Resolve, scroll, and wait until the element is settled and would receive a
@@ -307,6 +431,7 @@ impl Locator {
         // "still moving" and hide what actually stood in the way.
         let mut blocked: Option<String> = None;
         let mut last_rect: Option<[f64; 4]> = None;
+        let mut scroll_turn = 0usize;
         let mut gap = Backoff::FAST.start;
         loop {
             if start.elapsed() > timeout {
@@ -320,7 +445,10 @@ impl Locator {
                     start.elapsed()
                 );
             }
-            match self.attempt(checks, hover.as_deref(), &mut last_rect).await {
+            match self
+                .attempt(checks, hover.as_deref(), &mut last_rect, &mut scroll_turn)
+                .await
+            {
                 Ok(Ok(found)) => return Ok(found),
                 Ok(Err(Pending::Moving(why))) => reason = why,
                 Ok(Err(Pending::Blocked(why))) => {
@@ -340,23 +468,17 @@ impl Locator {
         checks: Checks,
         hover: Option<&str>,
         last_rect: &mut Option<[f64; 4]>,
+        scroll_turn: &mut usize,
     ) -> Result<std::result::Result<Aim, Pending>> {
         let Some(element) = self.resolve_strict().await? else {
             *last_rect = None;
             return Ok(Err(Pending::Blocked("no element matches".to_string())));
         };
         if !checks.force {
-            let scrolled: Result<bool> = self
-                .page
-                .call_on(
-                    &element,
-                    "(lib, el) => { lib.prescroll(el); return true; }",
-                    Vec::new(),
-                )
-                .await;
-            if let Err(error) = scrolled {
-                tracing::debug!("prescroll of {} failed: {error:#}", self.selector);
-            }
+            // As Playwright's actions do: visible and stable first, where the
+            // page leaves it, and only then scrolled. Measured after this
+            // action's own scroll, a page that puts its scroll back between
+            // attempts would read as an element that never holds still.
             let probe: Probe = self
                 .page
                 .call_on(
@@ -381,27 +503,28 @@ impl Locator {
                 *last_rect = probe.rect;
                 return Ok(Err(Pending::Moving(why)));
             }
+            let scrolled: Result<bool> = self
+                .page
+                .call_on(
+                    &element,
+                    "(lib, el, block) => { lib.scrollAligned(el, block); return true; }",
+                    vec![alignment(*scroll_turn)],
+                )
+                .await;
+            if let Err(error) = scrolled {
+                tracing::debug!("scrolling {} into view failed: {error:#}", self.selector);
+            }
         }
         let hit: Hit = self
             .page
             .call_on(&element, "(lib, el) => lib.hitPoint(el)", Vec::new())
             .await?;
         if hit.outside {
-            let scrolled: Result<bool> = self
-                .page
-                .call_on(
-                    &element,
-                    "(lib, el) => { lib.scrollIntoViewIfNeeded(el); return true; }",
-                    Vec::new(),
-                )
-                .await;
-            if let Err(error) = scrolled {
-                tracing::debug!("scrolling {} into view failed: {error:#}", self.selector);
-            }
+            *scroll_turn = scroll_turn.saturating_add(1);
             *last_rect = None;
             return Ok(Err(Pending::Blocked(hit.reason)));
         }
-        let local = (hit.x, hit.y);
+        let local = (hit.horizontal, hit.vertical);
         let hit = self.page.lift(&element.frame, hit).await?;
         if hit.outside {
             if let Err(error) = self.page.reveal(&element.frame, local.0, local.1).await {
@@ -411,14 +534,161 @@ impl Locator {
             return Ok(Err(Pending::Blocked(hit.reason)));
         }
         if checks.hit && !hit.ok && !checks.force {
+            // The next attempt scrolls with the next alignment: a sticky bar or a
+            // box clipping the element can cover where this one left it.
+            *scroll_turn = scroll_turn.saturating_add(1);
             *last_rect = None;
             return Ok(Err(Pending::Blocked(hit.reason)));
         }
         Ok(Ok(Aim {
             element,
             local,
-            top: (hit.x, hit.y),
+            top: (hit.horizontal, hit.vertical),
         }))
+    }
+
+    /// Before the attempt numbered `retry`: Playwright's wait, or the timeout
+    /// naming why the last attempt was abandoned.
+    async fn before_attempt(
+        &self,
+        action: &str,
+        retry: usize,
+        started: Instant,
+        timeout: Duration,
+        last: &AttemptLog,
+    ) -> Result<()> {
+        if started.elapsed() > timeout {
+            bail!(
+                "{action} {}: {last} (after {:?})",
+                self.selector,
+                started.elapsed()
+            );
+        }
+        if let Some(index) = retry.checked_sub(1) {
+            let wait = RETRY_WAITS
+                .get(index)
+                .or(RETRY_WAITS.last())
+                .copied()
+                .unwrap_or_default();
+            tokio::time::sleep(wait).await;
+        }
+        Ok(())
+    }
+
+    /// One attempt as Playwright's `_performPointerAction`, up to the input: the
+    /// target stable and visible (and enabled), scrolled with this attempt's
+    /// alignment, its clickable point found, the hit there checked and the
+    /// page's guard raised.
+    /// One attempt at aiming, where an error is another reason to try again:
+    /// as Playwright's retry loop does, only a strictness violation or a
+    /// browser that is gone ends the action. A frame that replaces its
+    /// document while the action resolves into it, as a card-field iframe does
+    /// while it starts, is retried until the action's timeout.
+    async fn aim_pointer(&self, pointer: Pointer, retry: usize) -> Result<Attempt> {
+        match self.aim_pointer_once(pointer, retry).await {
+            Ok(attempt) => Ok(attempt),
+            Err(error) if is_strictness(&error) || is_browser_gone(&error) => Err(error),
+            Err(error) => Ok(Attempt::Retry(format!("{error:#}"))),
+        }
+    }
+
+    async fn aim_pointer_once(&self, pointer: Pointer, retry: usize) -> Result<Attempt> {
+        let Some(element) = self.resolve_strict().await? else {
+            return Ok(Attempt::Retry("no element matches".to_string()));
+        };
+        if !pointer.force {
+            let state: String = self
+                .page
+                .call_on(
+                    &element,
+                    "(lib, el, enabled) => lib.pointerStates(el, enabled)",
+                    vec![JsArg::Bool(pointer.enabled)],
+                )
+                .await?;
+            match state.as_str() {
+                "ok" => {}
+                "notconnected" => {
+                    return Ok(Attempt::Retry(
+                        "element is not attached to the DOM".to_string(),
+                    ));
+                }
+                missing => return Ok(Attempt::Retry(format!("element is not {missing}"))),
+            }
+        }
+        if let Err(error) = self
+            .page
+            .call_on::<bool>(
+                &element,
+                "(lib, el, block) => { lib.scrollAligned(el, block); return true; }",
+                vec![alignment(retry)],
+            )
+            .await
+        {
+            return Ok(Attempt::Retry(format!(
+                "scrolling it into view failed: {error:#}"
+            )));
+        }
+        let point: Hit = self
+            .page
+            .call_on(&element, "(lib, el) => lib.clickablePoint(el)", Vec::new())
+            .await?;
+        if !point.ok {
+            return Ok(Attempt::Retry(format!("element is {}", point.reason)));
+        }
+        let local = (point.horizontal, point.vertical);
+        let top = self.page.lift(&element.frame, point).await?;
+        if top.outside {
+            if let Err(error) = self.page.reveal(&element.frame, local.0, local.1).await {
+                tracing::debug!("revealing the frame of {} failed: {error:#}", self.selector);
+            }
+            return Ok(Attempt::Retry(top.reason));
+        }
+        if !pointer.force {
+            let guarded: String = self
+                .page
+                .call_on(
+                    &element,
+                    "(lib, el, kind, x, y, followLabel) => lib.guardHits(el, kind, x, y, followLabel)",
+                    vec![
+                        JsArg::Str(pointer.guard.kind().to_string()),
+                        JsArg::Int(local.0),
+                        JsArg::Int(local.1),
+                        JsArg::Bool(pointer.follow_label),
+                    ],
+                )
+                .await?;
+            if guarded != "done" {
+                return Ok(Attempt::Retry(guarded));
+            }
+        }
+        Ok(Attempt::Aimed(Aim {
+            element,
+            local,
+            top: (top.horizontal, top.vertical),
+        }))
+    }
+
+    /// What the guard raised for `aim` found once the input ran: `Some` names
+    /// what took the gesture. An action that navigates leaves no page to ask,
+    /// which counts as a hit, as in Playwright.
+    async fn lift_guard(&self, aim: &Aim, pointer: Pointer) -> Option<String> {
+        if pointer.force {
+            return None;
+        }
+        match self
+            .page
+            .call_json::<String>(&aim.element.frame, "(lib) => lib.endHitGuard()", Vec::new())
+            .await
+        {
+            Ok(found) => (found != "done").then_some(found),
+            Err(error) => {
+                tracing::debug!(
+                    "reading the hit guard for {} failed: {error:#}",
+                    self.selector
+                );
+                None
+            }
+        }
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -437,68 +707,91 @@ impl Locator {
 
     pub async fn click_with(&self, options: ClickOptions) -> Result<()> {
         let timeout = self.timeout(options.timeout);
-        let start = Instant::now();
+        let started = Instant::now();
         let modifiers = options
             .modifiers
             .iter()
             .map(|name| parse_chord(name).map(|chord| chord.key))
             .collect::<Result<Vec<_>>>()?;
-        loop {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let checks = Checks {
-                enabled: true,
-                hit: true,
-                force: options.force,
+        let pointer = Pointer {
+            enabled: true,
+            force: options.force,
+            guard: Guard::Mouse,
+            follow_label: false,
+        };
+        let mut last = AttemptLog::default();
+        for retry in 0.. {
+            self.before_attempt("click", retry, started, timeout, &last)
+                .await?;
+            let aim = match self.aim_pointer(pointer, retry).await? {
+                Attempt::Aimed(aim) => aim,
+                Attempt::Retry(why) => {
+                    last.record(why);
+                    continue;
+                }
             };
-            let aim = self.actionable("click", checks, remaining).await?;
-            let (x, y) = aim.local;
-            match self
+            let (horizontal, vertical) = aim.local;
+            let clicked = self
                 .page
                 .click_at(
                     ClickPoint {
                         frame: &aim.element.frame,
                         anchor: Some(aim.anchor()),
-                        x,
-                        y,
+                        horizontal,
+                        vertical,
                     },
                     options.button,
                     options.click_count.max(1),
                     &modifiers,
                 )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(error) if start.elapsed() < timeout => {
-                    tracing::debug!("click on {} failed, retrying: {error:#}", self.selector);
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("click {}", self.selector));
-                }
+                .await;
+            let missed = self.lift_guard(&aim, pointer).await;
+            clicked.with_context(|| format!("click {}", self.selector))?;
+            match missed {
+                None => return Ok(()),
+                Some(why) => last.record(why),
             }
         }
+        bail!("click {}: {last}", self.selector)
     }
 
     pub async fn hover(&self) -> Result<()> {
-        let checks = Checks {
+        let timeout = self.timeout(None);
+        let started = Instant::now();
+        let pointer = Pointer {
             enabled: false,
-            hit: true,
             force: false,
+            guard: Guard::Hover,
+            follow_label: false,
         };
-        let aim = self.actionable("hover", checks, self.timeout(None)).await?;
-        let (x, y) = aim.local;
-        self.page
-            .pointer(
-                &aim.element.frame,
-                Some(aim.anchor()),
-                vec![PointerAction::PointerMove {
-                    x,
-                    y,
-                    duration: None,
-                    origin: "viewport",
-                }],
-            )
-            .await
+        let mut last = AttemptLog::default();
+        for retry in 0.. {
+            self.before_attempt("hover", retry, started, timeout, &last)
+                .await?;
+            let aim = match self.aim_pointer(pointer, retry).await? {
+                Attempt::Aimed(aim) => aim,
+                Attempt::Retry(why) => {
+                    last.record(why);
+                    continue;
+                }
+            };
+            let (horizontal, vertical) = aim.local;
+            let moved = self
+                .page
+                .pointer(
+                    &aim.element.frame,
+                    Some(aim.anchor()),
+                    vec![pointer_move((horizontal, vertical))],
+                )
+                .await;
+            let missed = self.lift_guard(&aim, pointer).await;
+            moved.with_context(|| format!("hover {}", self.selector))?;
+            match missed {
+                None => return Ok(()),
+                Some(why) => last.record(why),
+            }
+        }
+        bail!("hover {}: {last}", self.selector)
     }
 
     /// Replace the element's value with `text`, typing it as key events.
@@ -547,6 +840,125 @@ impl Locator {
 
     pub async fn clear(&self) -> Result<()> {
         self.fill("").await
+    }
+
+    /// Replace what the field holds with `text` the way a person does: a pointer
+    /// click at its centre, a check that focus landed there, select-all and one
+    /// Backspace, the keys, then every typed character required in the field in
+    /// order, so a mask passes. Native-picker and valueless inputs are refused.
+    pub async fn type_into(&self, text: &str) -> Result<()> {
+        let timeout = self.timeout(None);
+        let start = Instant::now();
+        // A pointer action, so the click must land on the field, as Playwright's
+        // hit-target check requires; a label bound to it counts as the field.
+        let pointer = Pointer {
+            enabled: true,
+            force: false,
+            guard: Guard::Mouse,
+            follow_label: true,
+        };
+        let mut last = AttemptLog::default();
+        let mut found = None;
+        for retry in 0.. {
+            self.before_attempt("type into", retry, start, timeout, &last)
+                .await?;
+            let aim = match self.aim_pointer(pointer, retry).await? {
+                Attempt::Aimed(aim) => aim,
+                Attempt::Retry(why) => {
+                    last.record(why);
+                    continue;
+                }
+            };
+            let before = self.typing_state(timeout).await?;
+            before.ensure_typable(&self.selector)?;
+            let (horizontal, vertical) = aim.local;
+            let clicked = self
+                .page
+                .click_at(
+                    ClickPoint {
+                        frame: &aim.element.frame,
+                        anchor: Some(aim.anchor()),
+                        horizontal,
+                        vertical,
+                    },
+                    MouseButton::Left,
+                    1,
+                    &[],
+                )
+                .await;
+            let missed = self.lift_guard(&aim, pointer).await;
+            clicked.with_context(|| format!("pointer click on {}", self.selector))?;
+            match missed {
+                None => {
+                    found = Some((aim, before));
+                    break;
+                }
+                Some(why) => last.record(why),
+            }
+        }
+        let Some((aim, before)) = found else {
+            bail!("type into {}: {last}", self.selector);
+        };
+        let focused = self.typing_state(timeout).await?;
+        if !focused.focused {
+            bail!(
+                "{} did not take focus: the click landed on {}, focus is on {}",
+                self.selector,
+                before.on_top,
+                focused.active
+            );
+        }
+        let keyboard = self.page.keyboard_in(aim.element.frame.clone());
+        if !focused.text.is_empty() {
+            // One selection delete, so a mask sees a single edit and an input handler fires once.
+            keyboard
+                .press("ControlOrMeta+a")
+                .await
+                .with_context(|| format!("select what {} holds", self.selector))?;
+            keyboard
+                .press("Backspace")
+                .await
+                .with_context(|| format!("clear {}", self.selector))?;
+            let cleared = self.typing_state(timeout).await?;
+            if !cleared.text.is_empty() {
+                bail!("clearing {} left {:?}", self.selector, cleared.text);
+            }
+        }
+        if !text.is_empty() {
+            keyboard
+                .type_text(text)
+                .await
+                .with_context(|| format!("type into {}", self.selector))?;
+        }
+        poll_until_ok(
+            || async {
+                let landed = self.typing_state(timeout).await?.text;
+                if typed_in_order(text, &landed) {
+                    return Ok(Some(()));
+                }
+                Err(anyhow!(
+                    "{} holds {landed:?} after typing {text:?}",
+                    self.selector
+                ))
+            },
+            timeout.saturating_sub(start.elapsed()),
+            Backoff::FAST,
+        )
+        .await
+        .map_err(|last| {
+            last.unwrap_or_else(|| {
+                anyhow!("{}: the typed value was never read back", self.selector)
+            })
+        })
+    }
+
+    /// Re-resolved on every read: typing may re-render the field.
+    async fn typing_state(&self, timeout: Duration) -> Result<TypingState> {
+        let element = self.wait_one(timeout).await?;
+        self.page
+            .call_on(&element, "(lib, el) => lib.typingState(el)", Vec::new())
+            .await
+            .with_context(|| format!("read the typing state of {}", self.selector))
     }
 
     /// Focus the element and type `text` without clearing it first.
@@ -643,82 +1055,142 @@ impl Locator {
     /// driver cannot perform natively, including every drag between frames, is
     /// carried out by firing the drag events in the pages.
     pub async fn drag_to(&self, target: &Locator) -> Result<()> {
-        let source_checks = Checks {
+        let timeout = self.timeout(None);
+        let started = Instant::now();
+        let target_frame = target.wait_one(target.timeout(None)).await?.frame;
+        // As Playwright's drag: the source pressed in one retried action, guarded
+        // as a click, and the target aimed only once the button is down (pressing
+        // can move it), its point checked before the release.
+        let press = Pointer {
             enabled: false,
-            hit: true,
             force: false,
+            guard: Guard::Mouse,
+            follow_label: false,
         };
-        let from = self
-            .actionable("drag", source_checks, self.timeout(None))
-            .await?;
-        let target_checks = Checks {
+        let drop = Pointer {
             enabled: false,
-            hit: false,
             force: false,
+            guard: Guard::Drop,
+            follow_label: false,
         };
-        let to = target
-            .actionable("drop onto", target_checks, self.timeout(None))
-            .await?;
-        let html5: bool = self
-            .page
-            .call_on(
-                &from.element,
-                "(lib, el) => !!lib.dragSource(el)",
-                Vec::new(),
-            )
-            .await
-            .with_context(|| format!("inspect {} as a drag source", self.selector))?;
-        let same_frame = from.element.frame == to.element.frame;
-        if html5 && !same_frame {
-            return self.drop_by_events(&from, &to, target).await;
-        }
-        if html5 {
-            self.page
-                .call_on::<()>(&from.element, "(lib) => lib.watchDrag()", Vec::new())
+        let mut last = AttemptLog::default();
+        let mut pressed = None;
+        for retry in 0.. {
+            self.before_attempt("drag", retry, started, timeout, &last)
+                .await?;
+            let from = match self.aim_pointer(press, retry).await? {
+                Attempt::Aimed(aim) => aim,
+                Attempt::Retry(why) => {
+                    last.record(why);
+                    continue;
+                }
+            };
+            let html5: bool = self
+                .page
+                .call_on(
+                    &from.element,
+                    "(lib, el) => !!lib.dragSource(el)",
+                    Vec::new(),
+                )
                 .await
-                .context("watch for a native drag")?;
+                .with_context(|| format!("inspect {} as a drag source", self.selector))?;
+            let same_frame = from.element.frame == target_frame;
+            if html5 && !same_frame {
+                // No driver carries a drag between frames: the drag events are
+                // fired in the pages instead, with no press to guard.
+                self.lift_guard(&from, press).await;
+                let to = target.aim_drop(drop, started, timeout).await?;
+                return self.drop_by_events(&from, &to, target, None).await;
+            }
+            if html5 {
+                self.page
+                    .call_on::<()>(&from.element, "(lib) => lib.watchDrag()", Vec::new())
+                    .await
+                    .context("watch for a native drag")?;
+            }
+            // Across frames a real mouse stays one gesture in top-level coordinates.
+            let (frame, anchor, start) = if same_frame {
+                (from.element.frame.clone(), Some(from.anchor()), from.local)
+            } else {
+                (Frame::top(), None, from.top)
+            };
+            self.page
+                .pointer(&frame, anchor, vec![pointer_move(start)])
+                .await
+                .with_context(|| format!("move onto {}", self.selector))?;
+            self.page
+                .pointer(&frame, anchor, vec![PointerAction::Down { button: 0 }])
+                .await
+                .with_context(|| format!("press on {}", self.selector))?;
+            match self.lift_guard(&from, press).await {
+                None => {
+                    pressed = Some((from, html5, same_frame, frame));
+                    break;
+                }
+                Some(why) => last.record(why),
+            }
         }
-        // Across frames a real mouse stays one gesture in top-level coordinates.
-        let (frame, anchor, start, end) = if same_frame {
-            (
-                from.element.frame.clone(),
-                Some(from.anchor()),
-                from.local,
-                to.local,
-            )
-        } else {
-            (Frame::top(), None, from.top, to.top)
+        let Some((from, html5, same_frame, frame)) = pressed else {
+            bail!("drag {}: {last}", self.selector);
         };
-        let mut actions = vec![
-            pointer_move(start, None),
-            PointerAction::PointerDown { button: 0 },
-            PointerAction::Pause { duration: 50 },
-        ];
-        actions.extend(glide(start, end, 1..=DRAG_STEPS));
-        actions.push(PointerAction::PointerUp { button: 0 });
+        let to = target.aim_drop(drop, started, timeout).await?;
+        // Classic input is anchored to the element it heads for, which the
+        // driver scrolls into view: anchored to the source, the move would scroll
+        // the source back and leave the target where it was aimed.
+        let (end, anchor) = if same_frame {
+            (to.local, Some(to.anchor()))
+        } else {
+            (to.top, None)
+        };
         self.page
-            .pointer(&frame, anchor, actions)
+            .pointer(&frame, anchor, vec![pointer_move(end)])
             .await
-            .with_context(|| format!("drag {} to {}", self.selector, target.selector))?;
+            .with_context(|| format!("move onto {}", target.selector))?;
+        self.page
+            .pointer(&frame, anchor, vec![PointerAction::Up { button: 0 }])
+            .await
+            .with_context(|| format!("release on {}", target.selector))?;
         if !html5 {
             return Ok(());
         }
-        let native: bool = self
+        let native: NativeDrag = self
             .page
-            .call_on(
-                &from.element,
-                "(lib) => lib.nativeDragEnded(500)",
-                Vec::new(),
-            )
+            .call_on(&from.element, "(lib) => lib.nativeDrag(500)", Vec::new())
             .await
             .context("check for a native drag")?;
-        if native {
+        if native.ended {
             return Ok(());
         }
-        self.drop_by_events(&from, &to, target).await
+        self.drop_by_events(&from, &to, target, Some(native)).await
     }
 
-    async fn drop_by_events(&self, from: &Aim, to: &Aim, target: &Locator) -> Result<()> {
+    /// The drop target aimed as Playwright's `move and up` aims it, retried
+    /// until `timeout` from `started`.
+    async fn aim_drop(&self, drop: Pointer, started: Instant, timeout: Duration) -> Result<Aim> {
+        let mut last = AttemptLog::default();
+        for retry in 0.. {
+            self.before_attempt("drop onto", retry, started, timeout, &last)
+                .await?;
+            match self.aim_pointer(drop, retry).await? {
+                Attempt::Aimed(aim) => {
+                    self.lift_guard(&aim, drop).await;
+                    return Ok(aim);
+                }
+                Attempt::Retry(why) => last.record(why),
+            }
+        }
+        bail!("drop onto {}: {last}", self.selector)
+    }
+
+    /// Fire the drag in the pages. `native` is what the browser's own drag came
+    /// to, when one was attempted, for the error should this drop be refused.
+    async fn drop_by_events(
+        &self,
+        from: &Aim,
+        to: &Aim,
+        target: &Locator,
+        native: Option<NativeDrag>,
+    ) -> Result<()> {
         let started: DragStart = self
             .page
             .call_on(
@@ -732,7 +1204,7 @@ impl Locator {
             bail!("{} cancelled its dragstart", self.selector);
         }
         let items = serde_json::to_string(&started.items).context("carry the drag data")?;
-        let effect: Result<String> = self
+        let outcome: Result<DropOutcome> = self
             .page
             .call_on(
                 &to.element,
@@ -746,14 +1218,17 @@ impl Locator {
             )
             .await
             .with_context(|| format!("drop onto {}", target.selector));
-        let dropped = effect
+        let dropped = outcome
             .as_ref()
-            .map_or_else(|_| "none".to_string(), Clone::clone);
+            .map_or_else(|_| "none".to_string(), |outcome| outcome.effect.clone());
+        // In the source's frame, not on the source: a page that re-renders its
+        // source on drop leaves that handle stale, and the drag it ends is kept
+        // on the frame's window.
         let ended: Result<()> = self
             .page
-            .call_on(
-                &from.element,
-                "(lib, el, x, y, effect) => lib.endDrag(x, y, effect)",
+            .call_json(
+                &from.element.frame,
+                "(lib, x, y, effect) => lib.endDrag(x, y, effect)",
                 vec![
                     JsArg::Int(from.local.0),
                     JsArg::Int(from.local.1),
@@ -761,10 +1236,19 @@ impl Locator {
                 ],
             )
             .await;
-        let effect = effect?;
+        let outcome = outcome?;
         ended.with_context(|| format!("end the drag of {}", self.selector))?;
-        if effect == "none" {
-            bail!("{} did not accept the drop", target.selector);
+        if outcome.effect == "none" {
+            let refused_by = outcome
+                .refused_by
+                .unwrap_or_else(|| "the element there".to_string());
+            let native = native.map_or("", NativeDrag::describe);
+            bail!(
+                "{} did not accept the drop: {refused_by} at ({}, {}) refused it; {native}",
+                target.selector,
+                to.local.0,
+                to.local.1
+            );
         }
         Ok(())
     }
@@ -775,13 +1259,13 @@ impl Locator {
             .page
             .call_on(
                 &element,
-                "(lib, el) => { lib.prescroll(el); if (lib.hitPoint(el).outside) lib.scrollIntoViewIfNeeded(el); return lib.hitPoint(el); }",
+                "(lib, el) => { lib.scrollIntoViewIfNeeded(el); return lib.hitPoint(el); }",
                 Vec::new(),
             )
             .await
             .with_context(|| format!("scroll {} into view", self.selector))?;
         self.page
-            .reveal(&element.frame, hit.x, hit.y)
+            .reveal(&element.frame, hit.horizontal, hit.vertical)
             .await
             .with_context(|| format!("scroll the frame of {} into view", self.selector))
     }
@@ -814,6 +1298,14 @@ impl Locator {
 
     pub async fn count(&self) -> Result<usize> {
         Ok(self.resolve_all().await?.len())
+    }
+
+    /// One locator per match, in document order, for when each match needs its
+    /// own read or action. The list is as long as the matches were when asked.
+    pub async fn all(&self) -> Result<Vec<Locator>> {
+        (0..self.count().await?)
+            .map(|index| -> Result<Locator> { Ok(self.nth(i64::try_from(index)?)) })
+            .collect()
     }
 
     /// Everything the runtime knows about the (single) element; waits for it to exist.
@@ -862,7 +1354,7 @@ impl Locator {
     pub async fn get_attribute(&self, name: &str) -> Result<Option<String>> {
         let element = self.wait_one(self.timeout(None)).await?;
         self.page
-            .evaluate_with(
+            .inspect_with(
                 &element.frame,
                 "(el, name) => el.getAttribute(name)",
                 vec![JsArg::El(element.clone()), JsArg::Str(name.to_string())],
@@ -883,6 +1375,17 @@ impl Locator {
         Ok(texts)
     }
 
+    /// Where the element is in its frame's viewport, rounded to whole pixels:
+    /// what a pointer aimed with [`Mouse`](crate::Mouse) needs.
+    pub async fn bounding_box(&self) -> Result<BoundingBox> {
+        self.eval_on(
+            "(el) => { const box = el.getBoundingClientRect(); return { \
+             left: Math.round(box.left), top: Math.round(box.top), \
+             width: Math.round(box.width), height: Math.round(box.height) }; }",
+        )
+        .await
+    }
+
     /// Call `function(element)` in the page and decode its result.
     pub async fn eval_on<T: DeserializeOwned>(&self, function: &str) -> Result<T> {
         let element = self.wait_one(self.timeout(None)).await?;
@@ -901,7 +1404,8 @@ impl Locator {
     }
 
     /// Wait for the element to reach `state`.
-    pub async fn wait_for(&self, state: ElementState, timeout: Duration) -> Result<()> {
+    pub async fn wait_for(&self, state: ElementState) -> Result<()> {
+        let timeout = self.timeout(None);
         let start = Instant::now();
         let mut gap = Backoff::FAST.start;
         loop {
@@ -951,4 +1455,10 @@ impl std::error::Error for StrictModeViolation {}
 
 fn is_strictness(error: &anyhow::Error) -> bool {
     error.downcast_ref::<StrictModeViolation>().is_some()
+}
+
+fn is_browser_gone(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::channel::BrowserGone>()
+        .is_some()
 }

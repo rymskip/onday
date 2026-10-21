@@ -104,7 +104,9 @@ impl Page {
                 let selector = format!("ref={}", element.reference);
                 let iframe = match self.resolve(frame, &selector).await? {
                     Resolution::Elements(mut found) if found.len() == 1 => found.remove(0),
-                    other => bail!(
+                    other @ (Resolution::Elements(_)
+                    | Resolution::Enter { .. }
+                    | Resolution::Frame { .. }) => bail!(
                         "frame {} did not resolve to itself: {other:?}",
                         element.reference
                     ),
@@ -165,7 +167,7 @@ fn render(nodes: &[Node], indent: usize, lines: &mut Vec<String>) {
         if let Some(value) = nested_value {
             lines.push(format!("{pad}  - /value: {}", quoted(value)));
         }
-        render(&element.children, indent + 1, lines);
+        render(&element.children, indent.saturating_add(1), lines);
     }
 }
 

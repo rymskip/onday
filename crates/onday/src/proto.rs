@@ -153,24 +153,20 @@ pub struct PointerParameters {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type")]
 pub enum PointerAction {
-    PointerMove {
-        x: i64,
-        y: i64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        duration: Option<u64>,
+    #[serde(rename = "pointerMove")]
+    Move {
+        #[serde(rename = "x")]
+        horizontal: i64,
+        #[serde(rename = "y")]
+        vertical: i64,
         origin: &'static str,
     },
-    PointerDown {
-        button: u8,
-    },
-    PointerUp {
-        button: u8,
-    },
-    Pause {
-        duration: u64,
-    },
+    #[serde(rename = "pointerDown")]
+    Down { button: u8 },
+    #[serde(rename = "pointerUp")]
+    Up { button: u8 },
 }
 
 #[derive(Debug, Serialize)]
@@ -184,8 +180,10 @@ pub enum KeyAction {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WheelAction {
     Scroll {
-        x: i64,
-        y: i64,
+        #[serde(rename = "x")]
+        horizontal: i64,
+        #[serde(rename = "y")]
+        vertical: i64,
         #[serde(rename = "deltaX")]
         delta_x: i64,
         #[serde(rename = "deltaY")]
@@ -224,12 +222,11 @@ impl BidiCommand for CaptureScreenshot {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ScreenshotClip {
-    Element {
-        element: SharedRef,
-    },
     Box {
-        x: f64,
-        y: f64,
+        #[serde(rename = "x")]
+        horizontal: f64,
+        #[serde(rename = "y")]
+        vertical: f64,
         width: f64,
         height: f64,
     },
@@ -325,7 +322,6 @@ pub struct ResponseCompletedEvent {
     pub context: Option<BrowsingContextId>,
     pub request: WireRequest,
     pub response: WireResponse,
-    pub timestamp: u64,
 }
 
 impl BidiEvent for ResponseCompletedEvent {
@@ -337,7 +333,6 @@ impl BidiEvent for ResponseCompletedEvent {
 pub struct FetchErrorEvent {
     pub context: Option<BrowsingContextId>,
     pub request: WireRequest,
-    pub timestamp: u64,
     pub error_text: String,
 }
 

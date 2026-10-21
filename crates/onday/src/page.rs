@@ -1,5 +1,6 @@
 //! A page (tab): navigation, scripting, input, screenshots, events and dialogs.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,12 +15,12 @@ use thirtyfour::bidi::modules::browsing_context::{
 };
 use thirtyfour::bidi::modules::network::{AddIntercept, InterceptPhase, RemoveIntercept};
 use thirtyfour::bidi::modules::script::Target;
-use thirtyfour::bidi::{BiDi, BrowsingContextId};
+use thirtyfour::bidi::{BiDi, BidiError, BrowsingContextId};
 use thirtyfour::{WebDriver, WebElement, WindowHandle};
 use tokio::sync::broadcast;
 
 use crate::channel::BidiChannel;
-use crate::context::ContextInner;
+use crate::context::{BrowserContext, ContextInner};
 use crate::events::{ConsoleMessage, Dialog, DialogPolicy, LoadPhase, NetworkEntry, PageEvents};
 use crate::frame::{Frame, FrameRegistry, FrameTarget};
 use crate::hooks::AppHooks;
@@ -49,26 +50,29 @@ pub(crate) enum PageTarget {
 pub(crate) struct Hit {
     pub(crate) ok: bool,
     pub(crate) reason: String,
-    pub(crate) x: i64,
-    pub(crate) y: i64,
+    #[serde(rename = "x")]
+    pub(crate) horizontal: i64,
+    #[serde(rename = "y")]
+    pub(crate) vertical: i64,
     pub(crate) outside: bool,
 }
 
 /// An element and a point of it in its frame's viewport. Classic drivers disagree on
 /// which viewport a frame's coordinates mean, so Classic pointer moves are expressed
 /// relative to this element instead, which the spec pins down.
+#[derive(Clone, Copy)]
 pub(crate) struct Anchor<'a> {
     pub(crate) element: &'a ElementRef,
-    pub(crate) x: i64,
-    pub(crate) y: i64,
+    pub(crate) horizontal: i64,
+    pub(crate) vertical: i64,
 }
 
 /// Where a click lands: `(x, y)` in `frame`'s viewport, anchored for Classic input.
 pub(crate) struct ClickPoint<'a> {
     pub(crate) frame: &'a Frame,
     pub(crate) anchor: Option<Anchor<'a>>,
-    pub(crate) x: i64,
-    pub(crate) y: i64,
+    pub(crate) horizontal: i64,
+    pub(crate) vertical: i64,
 }
 
 /// A DOM element and the frame whose scripts can use it.
@@ -83,6 +87,39 @@ pub(crate) struct ElementRef {
 enum Handle {
     Bidi(String),
     Classic(WebElement),
+}
+
+/// The JavaScript world a BiDi call runs in. Node references cross between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum World {
+    /// The page's own globals, for a caller's script.
+    Page,
+    /// onday's sandbox, which the page's scripts cannot see or disturb. Some
+    /// drivers never answer a call into a third-party frame's own world (Stripe's
+    /// card fields under chromedriver), while its sandbox answers at once.
+    Runtime,
+}
+
+const RUNTIME_SANDBOX: &str = "onday";
+
+/// The name of onday's sandbox in a frame after `renewals` replacements.
+fn runtime_sandbox(renewals: u32) -> String {
+    match renewals {
+        0 => RUNTIME_SANDBOX.to_string(),
+        renewed => format!("{RUNTIME_SANDBOX}-{renewed}"),
+    }
+}
+
+/// Whether a call failed because the driver lost the sandbox it was sent to.
+/// chromedriver can come to answer every call into onday's sandbox in a frame
+/// with an internal assertion (seen on Stripe's card fields) while a sandbox
+/// under another name in the same frame works.
+fn lost_sandbox(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BidiError>()
+            .is_some_and(|bidi| bidi.error == "unknown error")
+    })
 }
 
 /// Where a selector resolved in one frame continues.
@@ -256,6 +293,8 @@ pub(crate) struct PageInner {
     pub(crate) target: PageTarget,
     pub(crate) events: Arc<PageEvents>,
     frames: FrameRegistry,
+    /// Per frame, how many times its sandbox was replaced (see [`lost_sandbox`]).
+    sandboxes: Mutex<HashMap<BrowsingContextId, u32>>,
     timeout: Mutex<Duration>,
     closed: AtomicBool,
 }
@@ -274,6 +313,15 @@ impl std::fmt::Debug for Page {
             .finish()
     }
 }
+
+/// Two handles are equal when they are on the same tab.
+impl PartialEq for Page {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.target == other.inner.target
+    }
+}
+
+impl Eq for Page {}
 
 #[derive(Debug, Deserialize)]
 struct Drained {
@@ -311,6 +359,7 @@ impl Page {
                 target,
                 events,
                 frames: FrameRegistry::default(),
+                sandboxes: Mutex::new(HashMap::new()),
                 timeout: Mutex::new(DEFAULT_TIMEOUT),
                 closed: AtomicBool::new(false),
             }),
@@ -327,6 +376,14 @@ impl Page {
         self.context.session.protocol()
     }
 
+    /// The context this tab belongs to, which holds its sibling tabs and its
+    /// cookies.
+    pub fn context(&self) -> BrowserContext {
+        BrowserContext {
+            inner: self.context.clone(),
+        }
+    }
+
     pub fn hooks(&self) -> &Arc<dyn AppHooks> {
         &self.context.hooks
     }
@@ -334,6 +391,26 @@ impl Page {
     /// The raw thirtyfour driver behind this page.
     pub fn driver(&self) -> &WebDriver {
         &self.context.session.driver
+    }
+
+    /// The raw driver with the session's own window switched to this tab, for
+    /// the Classic-only commands BiDi has no word for, such as WebAuthn's
+    /// virtual authenticator. A tab's BiDi context id is its window handle.
+    pub async fn driver_on_tab(&self) -> Result<&WebDriver> {
+        let handle = match &self.inner.target {
+            PageTarget::Classic(handle) => handle.clone(),
+            PageTarget::Bidi(context) => WindowHandle::from(context.as_str()),
+        };
+        let mut current = self.context.session.classic_window.lock().await;
+        if current.as_ref() != Some(&handle) {
+            self.driver()
+                .switch_to_window(handle.clone())
+                .await
+                .context("switch the session's window to this tab")?;
+            *current = Some(handle);
+        }
+        drop(current);
+        Ok(self.driver())
     }
 
     /// The raw BiDi connection, when negotiated.
@@ -422,7 +499,7 @@ impl Page {
         };
         let ready = match wait {
             WaitUntil::Ready => self.hooks().ready_script(),
-            _ => None,
+            WaitUntil::Commit | WaitUntil::DomContentLoaded | WaitUntil::Load => None,
         };
         if ready.is_some() {
             self.stamp_navigation().await;
@@ -509,10 +586,12 @@ impl Page {
     /// error page instead, so a document on that page is the failure.
     async fn fail_on_error_page(&self) -> Result<()> {
         let code: Option<String> = self
-            .evaluate(
+            .inspect_with(
+                &Frame::top(),
                 "document.URL.startsWith('chrome-error://') \
                  ? ((document.querySelector('.error-code') || {}).textContent || 'no error code') \
                  : null",
+                Vec::new(),
             )
             .await
             .context("check for the browser's error page")?;
@@ -636,13 +715,18 @@ impl Page {
     }
 
     pub async fn title(&self) -> Result<String> {
-        self.evaluate("document.title").await
+        self.inspect_with(&Frame::top(), "document.title", Vec::new())
+            .await
     }
 
     /// The document's serialized HTML.
     pub async fn content(&self) -> Result<String> {
-        self.evaluate("document.documentElement ? document.documentElement.outerHTML : ''")
-            .await
+        self.inspect_with(
+            &Frame::top(),
+            "document.documentElement ? document.documentElement.outerHTML : ''",
+            Vec::new(),
+        )
+        .await
     }
 
     /// Poll until the URL matches `glob` (see [`glob_matches`](crate::route::glob_matches)).
@@ -676,14 +760,50 @@ impl Page {
             .await
     }
 
+    /// Like [`Self::evaluate`], but in onday's own world: the script reads and
+    /// changes the same document, under pristine globals the page cannot patch,
+    /// and the page cannot see what it defines. Over Classic, which has no
+    /// such world, it runs in the page's.
+    pub async fn inspect<T: DeserializeOwned>(&self, expression: &str) -> Result<T> {
+        self.inspect_with(&Frame::top(), expression, Vec::new())
+            .await
+    }
+
     pub(crate) async fn evaluate_with<T: DeserializeOwned>(
         &self,
         frame: &Frame,
         expression: &str,
         args: Vec<JsArg>,
     ) -> Result<T> {
+        self.evaluate_in(frame, World::Page, expression, args).await
+    }
+
+    /// Like [`Self::evaluate_with`], but out of the page's reach: for reading the
+    /// document, which needs none of the page's own globals.
+    pub(crate) async fn inspect_with<T: DeserializeOwned>(
+        &self,
+        frame: &Frame,
+        expression: &str,
+        args: Vec<JsArg>,
+    ) -> Result<T> {
+        self.evaluate_in(frame, World::Runtime, expression, args)
+            .await
+    }
+
+    async fn evaluate_in<T: DeserializeOwned>(
+        &self,
+        frame: &Frame,
+        world: World,
+        expression: &str,
+        args: Vec<JsArg>,
+    ) -> Result<T> {
         let text = self
-            .call_text(frame, |prelude| js::user_call(expression, prelude), args)
+            .call_text(
+                frame,
+                world,
+                |prelude| js::user_call(expression, prelude),
+                args,
+            )
             .await
             .with_context(|| format!("evaluate {}", abbreviate(expression)))?;
         serde_json::from_str(&text)
@@ -726,7 +846,12 @@ impl Page {
         args: Vec<JsArg>,
     ) -> Result<T> {
         let text = self
-            .call_text(frame, |prelude| js::json_call(func, prelude), args)
+            .call_text(
+                frame,
+                World::Runtime,
+                |prelude| js::json_call(func, prelude),
+                args,
+            )
             .await?;
         serde_json::from_str(&text).with_context(|| format!("decode page runtime result {text}"))
     }
@@ -746,6 +871,7 @@ impl Page {
     async fn call_text(
         &self,
         frame: &Frame,
+        world: World,
         declare: impl Fn(&str) -> String,
         args: Vec<JsArg>,
     ) -> Result<String> {
@@ -755,11 +881,18 @@ impl Page {
                 let declaration = declare("");
                 self.with_runtime(frame, || async {
                     let result = self
-                        .bidi_call(frame, declaration.clone(), &args, Some(true))
+                        .bidi_call(frame, world, declaration.clone(), &args, Some(true))
                         .await?;
                     match result {
                         RemoteValue::String { value } => Ok(present(value)),
-                        other => bail!("expected JSON text from the page, got {other:?}"),
+                        other @ (RemoteValue::Null
+                        | RemoteValue::Undefined
+                        | RemoteValue::Array { .. }
+                        | RemoteValue::Node { .. }
+                        | RemoteValue::Window { .. }
+                        | RemoteValue::Other) => {
+                            bail!("expected JSON text from the page, got {other:?}")
+                        }
                     }
                 })
                 .await?
@@ -806,7 +939,7 @@ impl Page {
     async fn install_runtime(&self, frame: &Frame) -> Result<()> {
         match &self.inner.target {
             PageTarget::Bidi(_) => {
-                self.bidi_call(frame, js::install_call(), &[], None)
+                self.bidi_call(frame, World::Runtime, js::install_call(), &[], None)
                     .await
                     .context("install the page runtime")?;
             }
@@ -826,27 +959,43 @@ impl Page {
     async fn bidi_call(
         &self,
         frame: &Frame,
+        world: World,
         function_declaration: String,
         args: &[JsArg],
         user_activation: Option<bool>,
     ) -> Result<RemoteValue> {
-        let arguments = args
-            .iter()
-            .map(JsArg::to_local)
-            .collect::<Result<Vec<_>>>()?;
-        let result = self
-            .bidi_handle()?
-            .send(CallFunction {
-                function_declaration,
-                await_promise: true,
-                target: Target::Context {
-                    context: self.bidi_context(frame)?,
-                    sandbox: None,
-                },
-                arguments,
-                user_activation,
-            })
-            .await?;
+        let context = self.bidi_context(frame)?;
+        let call = || async {
+            let arguments = args
+                .iter()
+                .map(JsArg::to_local)
+                .collect::<Result<Vec<_>>>()?;
+            let sandbox = match world {
+                World::Page => None,
+                World::Runtime => Some(runtime_sandbox(self.sandbox_renewals(&context))),
+            };
+            self.bidi_handle()?
+                .send(CallFunction {
+                    function_declaration: function_declaration.clone(),
+                    await_promise: true,
+                    target: Target::Context {
+                        context: context.clone(),
+                        sandbox,
+                    },
+                    arguments,
+                    user_activation,
+                })
+                .await
+        };
+        // A fresh sandbox holds no runtime, which the runtime calls then install.
+        let result = match call().await {
+            Err(error) if world == World::Runtime && lost_sandbox(&error) => {
+                tracing::debug!("the driver lost onday's sandbox in {context}; using a new one");
+                self.renew_sandbox(&context);
+                call().await?
+            }
+            settled => settled?,
+        };
         match result {
             CallResult::Success { result } => Ok(result),
             CallResult::Exception { exception_details } => bail!(
@@ -871,14 +1020,21 @@ impl Page {
                 let value = self
                     .with_runtime(frame, || async {
                         match self
-                            .bidi_call(frame, declaration.clone(), &args, None)
+                            .bidi_call(frame, World::Runtime, declaration.clone(), &args, None)
                             .await?
                         {
                             RemoteValue::Array { value } => Ok(Some(value)),
                             RemoteValue::String { value } if value == js::RUNTIME_MISSING => {
                                 Ok(None)
                             }
-                            other => bail!("expected a resolution array, got {other:?}"),
+                            other @ (RemoteValue::String { .. }
+                            | RemoteValue::Null
+                            | RemoteValue::Undefined
+                            | RemoteValue::Node { .. }
+                            | RemoteValue::Window { .. }
+                            | RemoteValue::Other) => {
+                                bail!("expected a resolution array, got {other:?}")
+                            }
                         }
                     })
                     .await?;
@@ -892,7 +1048,14 @@ impl Page {
                             frame: frame.clone(),
                             handle: Handle::Bidi(shared_id),
                         })),
-                        other => Err(anyhow!("unexpected {other:?} in a resolution")),
+                        other @ (RemoteValue::Node { shared_id: None }
+                        | RemoteValue::Null
+                        | RemoteValue::Undefined
+                        | RemoteValue::Array { .. }
+                        | RemoteValue::Window { .. }
+                        | RemoteValue::Other) => {
+                            Err(anyhow!("unexpected {other:?} in a resolution"))
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?
             }
@@ -949,6 +1112,7 @@ impl Page {
                 let result = self
                     .bidi_call(
                         &element.frame,
+                        World::Runtime,
                         "(el) => el.contentWindow".to_string(),
                         &[JsArg::El(element.clone())],
                         None,
@@ -983,7 +1147,7 @@ impl Page {
                 .call_on(
                     &host,
                     "(lib, el, x, y) => lib.frameHit(el, x, y)",
-                    vec![JsArg::Int(lifted.x), JsArg::Int(lifted.y)],
+                    vec![JsArg::Int(lifted.horizontal), JsArg::Int(lifted.vertical)],
                 )
                 .await
                 .context("place the point in the parent frame")?;
@@ -995,8 +1159,8 @@ impl Page {
                 } else {
                     lifted.reason
                 },
-                x: outer.x,
-                y: outer.y,
+                horizontal: outer.horizontal,
+                vertical: outer.vertical,
                 outside: lifted.outside || outer.outside,
             };
             current = host.frame;
@@ -1005,19 +1169,19 @@ impl Page {
     }
 
     /// Scroll each ancestor document until `(x, y)` in `frame`'s viewport is on screen.
-    pub(crate) async fn reveal(&self, frame: &Frame, x: i64, y: i64) -> Result<()> {
-        let (mut x, mut y) = (x, y);
+    pub(crate) async fn reveal(&self, frame: &Frame, horizontal: i64, vertical: i64) -> Result<()> {
+        let (mut horizontal, mut vertical) = (horizontal, vertical);
         let mut current = frame.clone();
         while let Some(host) = current.host.take() {
             let outer: Hit = self
                 .call_on(
                     &host,
                     "(lib, el, x, y) => lib.revealFrame(el, x, y)",
-                    vec![JsArg::Int(x), JsArg::Int(y)],
+                    vec![JsArg::Int(horizontal), JsArg::Int(vertical)],
                 )
                 .await
                 .context("scroll the frame into view")?;
-            (x, y) = (outer.x, outer.y);
+            (horizontal, vertical) = (outer.horizontal, outer.vertical);
             current = host.frame;
         }
         Ok(())
@@ -1025,18 +1189,18 @@ impl Page {
 
     /// Where `frame`'s viewport starts in the top-level viewport.
     async fn frame_origin(&self, frame: &Frame) -> Result<(f64, f64)> {
-        let (mut x, mut y) = (0.0, 0.0);
+        let (mut horizontal, mut vertical) = (0.0, 0.0);
         let mut current = frame.clone();
         while let Some(host) = current.host.take() {
             let [dx, dy]: [f64; 2] = self
                 .call_on(&host, "(lib, el) => lib.frameOffset(el)", Vec::new())
                 .await
                 .context("measure the frame")?;
-            x += dx;
-            y += dy;
+            horizontal += dx;
+            vertical += dy;
             current = host.frame;
         }
-        Ok((x, y))
+        Ok((horizontal, vertical))
     }
 
     /// The frame whose refs carry `prefix`.
@@ -1143,29 +1307,31 @@ impl Page {
                         handle: Handle::Classic(element),
                         ..
                     },
-                x,
-                y,
-            }) => Some((element, x, y)),
+                horizontal,
+                vertical,
+            }) => Some((element, horizontal, vertical)),
             Some(_) => bail!("a BiDi element cannot anchor Classic input"),
             None => None,
         };
         let mut chain = self.driver().action_chain();
         for action in actions {
             chain = match action {
-                PointerAction::PointerMove { x, y, .. } => match anchor {
-                    Some((element, ax, ay)) => {
-                        chain.move_to_element_with_offset(element, x - ax, y - ay)
-                    }
-                    None => chain.move_to(x, y),
+                PointerAction::Move {
+                    horizontal,
+                    vertical,
+                    ..
+                } => match anchor {
+                    Some((element, anchor_horizontal, anchor_vertical)) => chain
+                        .move_to_element_with_offset(
+                            element,
+                            horizontal.saturating_sub(anchor_horizontal),
+                            vertical.saturating_sub(anchor_vertical),
+                        ),
+                    None => chain.move_to(horizontal, vertical),
                 },
-                PointerAction::PointerDown { button: 0 } => chain.click_and_hold(),
-                PointerAction::PointerUp { button: 0 } => chain.release(),
-                PointerAction::Pause { duration } => {
-                    chain.perform().await.context("perform pointer actions")?;
-                    tokio::time::sleep(Duration::from_millis(duration)).await;
-                    self.driver().action_chain()
-                }
-                PointerAction::PointerDown { button } | PointerAction::PointerUp { button } => {
+                PointerAction::Down { button: 0 } => chain.click_and_hold(),
+                PointerAction::Up { button: 0 } => chain.release(),
+                PointerAction::Down { button } | PointerAction::Up { button } => {
                     bail!("mouse button {button} needs a BiDi session")
                 }
             };
@@ -1183,17 +1349,16 @@ impl Page {
         let ClickPoint {
             frame,
             anchor,
-            x,
-            y,
+            horizontal,
+            vertical,
         } = point;
         if let PageTarget::Classic(_) = &self.inner.target
             && button != MouseButton::Left
         {
             if button == MouseButton::Right && count == 1 && modifiers.is_empty() {
-                let actions = vec![PointerAction::PointerMove {
-                    x,
-                    y,
-                    duration: None,
+                let actions = vec![PointerAction::Move {
+                    horizontal,
+                    vertical,
                     origin: "viewport",
                 }];
                 self.pointer(frame, anchor, actions).await?;
@@ -1218,17 +1383,16 @@ impl Page {
                 .collect(),
         )
         .await?;
-        let mut actions = vec![PointerAction::PointerMove {
-            x,
-            y,
-            duration: None,
+        let mut actions = vec![PointerAction::Move {
+            horizontal,
+            vertical,
             origin: "viewport",
         }];
         for _ in 0..count.max(1) {
-            actions.push(PointerAction::PointerDown {
+            actions.push(PointerAction::Down {
                 button: button.code(),
             });
-            actions.push(PointerAction::PointerUp {
+            actions.push(PointerAction::Up {
                 button: button.code(),
             });
         }
@@ -1275,14 +1439,20 @@ impl Page {
         }
     }
 
-    pub(crate) async fn wheel(&self, x: i64, y: i64, delta_x: i64, delta_y: i64) -> Result<()> {
+    pub(crate) async fn wheel(
+        &self,
+        horizontal: i64,
+        vertical: i64,
+        delta_x: i64,
+        delta_y: i64,
+    ) -> Result<()> {
         match &self.inner.target {
             PageTarget::Bidi(context) => {
                 let source = SourceActions::Wheel {
                     id: "onday-wheel".to_string(),
                     actions: vec![WheelAction::Scroll {
-                        x,
-                        y,
+                        horizontal,
+                        vertical,
                         delta_x,
                         delta_y,
                         origin: "viewport",
@@ -1290,9 +1460,20 @@ impl Page {
                 };
                 self.perform(context, source, "wheel").await
             }
+            // Classic has no wheel this session can send, so the scroller the
+            // wheel would have reached is moved instead.
             PageTarget::Classic(_) => self
                 .evaluate::<bool>(&format!(
-                    "(() => {{ window.scrollBy({delta_x}, {delta_y}); return true; }})()"
+                    "(() => {{ \
+                     const scrolls = (el) => {{ \
+                       const style = getComputedStyle(el); \
+                       return /(auto|scroll)/.test(style.overflowY + style.overflowX) \
+                         && (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth); \
+                     }}; \
+                     let el = document.elementFromPoint({horizontal}, {vertical}); \
+                     while (el && el !== document.documentElement && !scrolls(el)) el = el.parentElement; \
+                     (el && el !== document.documentElement ? el : window).scrollBy({delta_x}, {delta_y}); \
+                     return true; }})()"
                 ))
                 .await
                 .map(|_| ()),
@@ -1360,45 +1541,39 @@ impl Page {
 
     pub(crate) async fn element_screenshot(&self, element: &ElementRef) -> Result<Vec<u8>> {
         match &element.handle {
-            Handle::Bidi(shared_id) => {
-                // Captures run on the top-level context, where a frame's node ids mean
-                // nothing; clip to the element's box instead.
-                let (origin, clip) = match &element.frame.target {
-                    FrameTarget::Top => (
-                        "document",
-                        ScreenshotClip::Element {
-                            element: SharedRef {
-                                shared_id: shared_id.clone(),
-                            },
-                        },
-                    ),
-                    _ => {
-                        let [x, y, width, height]: [f64; 4] = self
-                            .call_on(
-                                element,
-                                "(lib, el) => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }",
-                                Vec::new(),
-                            )
-                            .await
-                            .context("measure the element")?;
-                        let (dx, dy) = self.frame_origin(&element.frame).await?;
-                        (
-                            "viewport",
-                            ScreenshotClip::Box {
-                                x: x + dx,
-                                y: y + dy,
-                                width,
-                                height,
-                            },
-                        )
-                    }
-                };
+            Handle::Bidi(_) => {
+                // As Playwright does: the element's box moved by its frames and by
+                // the page's scroll, captured as a box of the document. An element
+                // clip lets Chromium place an element inside a fixed container that
+                // scrolls on its own somewhere else entirely.
+                let [horizontal, vertical, width, height]: [f64; 4] = self
+                    .call_on(
+                        element,
+                        "(lib, el) => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }",
+                        Vec::new(),
+                    )
+                    .await
+                    .context("measure the element")?;
+                let (dx, dy) = self.frame_origin(&element.frame).await?;
+                let [scroll_x, scroll_y]: [f64; 2] = self
+                    .inspect_with(
+                        &Frame::top(),
+                        "[window.scrollX, window.scrollY]",
+                        Vec::new(),
+                    )
+                    .await
+                    .context("read the page's scroll")?;
                 let shot = self
                     .bidi_handle()?
                     .send(CaptureScreenshot {
                         context: self.bidi_context(&Frame::top())?,
-                        origin,
-                        clip: Some(clip),
+                        origin: "document",
+                        clip: Some(ScreenshotClip::Box {
+                            horizontal: horizontal + dx + scroll_x,
+                            vertical: vertical + dy + scroll_y,
+                            width,
+                            height,
+                        }),
                     })
                     .await
                     .context("capture the element")?;
@@ -1443,8 +1618,12 @@ impl Page {
 
     /// The viewport's CSS size.
     pub async fn viewport(&self) -> Result<(u32, u32)> {
-        self.evaluate("[window.innerWidth, window.innerHeight]")
-            .await
+        self.inspect_with(
+            &Frame::top(),
+            "[window.innerWidth, window.innerHeight]",
+            Vec::new(),
+        )
+        .await
     }
 
     pub async fn bring_to_front(&self) -> Result<()> {
@@ -1533,6 +1712,9 @@ impl Page {
     pub async fn handle_dialog(&self, accept: bool, prompt_text: Option<String>) -> Result<()> {
         match &self.inner.target {
             PageTarget::Bidi(context) => {
+                // Off the record before the answer is sent, as Playwright's dialog
+                // manager does: an answer that fails leaves no dialog to wait on.
+                self.inner.events.set_dialog(None);
                 self.bidi_handle()?
                     .send(HandleUserPrompt {
                         context: context.clone(),
@@ -1540,7 +1722,6 @@ impl Page {
                         user_text: prompt_text,
                     })
                     .await?;
-                self.inner.events.set_dialog(None);
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -1606,7 +1787,7 @@ impl Page {
         for message in drained.console {
             self.inner
                 .events
-                .push_console(message.level, message.text, message.time, None);
+                .push_console(message.level, message.text, message.time, Vec::new());
         }
         for request in drained.network {
             self.inner.events.push_network(NetworkEntry {
@@ -1619,6 +1800,7 @@ impl Page {
                 mime_type: None,
                 error: request.error,
                 started: request.time,
+                settled_at: Some(request.time.saturating_add(request.duration_ms)),
                 duration_ms: Some(request.duration_ms),
                 request_headers: Vec::new(),
                 response_headers: Vec::new(),
@@ -1669,6 +1851,27 @@ impl Page {
             .bidi
             .as_ref()
             .context("this page's session has no BiDi connection")
+    }
+
+    /// How many times onday's sandbox in `context` was replaced.
+    fn sandbox_renewals(&self, context: &BrowsingContextId) -> u32 {
+        self.inner
+            .sandboxes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(context)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn renew_sandbox(&self, context: &BrowsingContextId) {
+        let mut sandboxes = self
+            .inner
+            .sandboxes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let renewals = sandboxes.entry(context.clone()).or_insert(0);
+        *renewals = renewals.saturating_add(1);
     }
 
     /// The BiDi browsing context holding `frame`'s document.
@@ -1773,13 +1976,13 @@ impl Keyboard<'_> {
     pub async fn type_text(&self, text: &str) -> Result<()> {
         let actions = text
             .chars()
-            .flat_map(|c| {
+            .flat_map(|character| {
                 [
                     KeyAction::KeyDown {
-                        value: c.to_string(),
+                        value: character.to_string(),
                     },
                     KeyAction::KeyUp {
-                        value: c.to_string(),
+                        value: character.to_string(),
                     },
                 ]
             })
@@ -1816,14 +2019,14 @@ pub struct Mouse<'a> {
 }
 
 impl Mouse<'_> {
-    pub async fn click(&self, x: i64, y: i64, button: MouseButton) -> Result<()> {
+    pub async fn click(&self, horizontal: i64, vertical: i64, button: MouseButton) -> Result<()> {
         self.page
             .click_at(
                 ClickPoint {
                     frame: &Frame::top(),
                     anchor: None,
-                    x,
-                    y,
+                    horizontal,
+                    vertical,
                 },
                 button,
                 1,
@@ -1832,23 +2035,57 @@ impl Mouse<'_> {
             .await
     }
 
-    pub async fn move_to(&self, x: i64, y: i64) -> Result<()> {
+    pub async fn move_to(&self, horizontal: i64, vertical: i64) -> Result<()> {
         self.page
             .pointer(
                 &Frame::top(),
                 None,
-                vec![PointerAction::PointerMove {
-                    x,
-                    y,
-                    duration: None,
+                vec![PointerAction::Move {
+                    horizontal,
+                    vertical,
                     origin: "viewport",
                 }],
             )
             .await
     }
 
+    /// Press the left button at the first of `points`, pass through the rest
+    /// and release at the last: a drag, or a stroke on a canvas.
+    pub async fn stroke(&self, points: &[(i64, i64)]) -> Result<()> {
+        let mut actions = Vec::new();
+        for (index, (horizontal, vertical)) in points.iter().copied().enumerate() {
+            actions.push(PointerAction::Move {
+                horizontal,
+                vertical,
+                origin: "viewport",
+            });
+            if index == 0 {
+                actions.push(PointerAction::Down { button: 0 });
+            }
+        }
+        if actions.is_empty() {
+            bail!("a stroke needs a point to start at");
+        }
+        actions.push(PointerAction::Up { button: 0 });
+        self.page.pointer(&Frame::top(), None, actions).await
+    }
+
     pub async fn wheel(&self, delta_x: i64, delta_y: i64) -> Result<()> {
         self.page.wheel(0, 0, delta_x, delta_y).await
+    }
+
+    /// Turn the wheel with the pointer at a viewport point: where the pointer
+    /// is decides which scroller moves.
+    pub async fn wheel_at(
+        &self,
+        horizontal: i64,
+        vertical: i64,
+        delta_x: i64,
+        delta_y: i64,
+    ) -> Result<()> {
+        self.page
+            .wheel(horizontal, vertical, delta_x, delta_y)
+            .await
     }
 }
 
@@ -1876,7 +2113,7 @@ fn check_frames(frame: &Frame, args: &[JsArg]) -> Result<()> {
 fn single_char(value: &str) -> Result<char> {
     let mut chars = value.chars();
     match (chars.next(), chars.next()) {
-        (Some(c), None) => Ok(c),
+        (Some(character), None) => Ok(character),
         _ => bail!("{value:?} is not a single key"),
     }
 }

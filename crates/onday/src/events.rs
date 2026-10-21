@@ -36,6 +36,11 @@ pub struct ConsoleMessage {
     pub timestamp: u64,
     /// `url:line:column` of the call site, when the browser reports one.
     pub location: Option<String>,
+    /// Every frame of the call, innermost first, as `url:line:column`. The
+    /// first frame can be a wrapper the page put around `console`, so the
+    /// caller is often further down.
+    #[serde(default)]
+    pub stack: Vec<String>,
 }
 
 /// An HTTP header.
@@ -65,7 +70,12 @@ pub struct NetworkEntry {
     pub status_text: Option<String>,
     pub mime_type: Option<String>,
     pub error: Option<String>,
+    /// When the browser started the request: milliseconds since the Unix epoch.
     pub started: u64,
+    /// When onday learned the request finished or failed, by its own clock:
+    /// milliseconds since the Unix epoch. Chromium stamps every event of a
+    /// request with its start, so the protocol's own timestamps cannot say.
+    pub settled_at: Option<u64>,
     pub duration_ms: Option<u64>,
     pub request_headers: Vec<Header>,
     pub response_headers: Vec<Header>,
@@ -183,17 +193,18 @@ impl PageEvents {
         level: String,
         text: String,
         timestamp: u64,
-        location: Option<String>,
+        stack: Vec<String>,
     ) {
         let message = {
             let mut history = self.lock_history();
-            history.next_console += 1;
+            history.next_console = history.next_console.saturating_add(1);
             let message = ConsoleMessage {
                 seq: history.next_console,
                 level,
                 text,
                 timestamp,
-                location,
+                location: stack.first().cloned(),
+                stack,
             };
             history.console.push_back(message.clone());
             if history.console.len() > CONSOLE_CAP {
@@ -201,10 +212,7 @@ impl PageEvents {
             }
             message
         };
-        // No receivers is the common case and not an error.
-        if self.console_tx.receiver_count() > 0 {
-            self.console_tx.send(message).ok();
-        }
+        publish(&self.console_tx, message);
     }
 
     pub(crate) fn request_started(
@@ -223,7 +231,7 @@ impl PageEvents {
         {
             return;
         }
-        history.next_network += 1;
+        history.next_network = history.next_network.saturating_add(1);
         let seq = history.next_network;
         history.network.push_back(NetworkEntry {
             seq,
@@ -235,6 +243,7 @@ impl PageEvents {
             mime_type: None,
             error: None,
             started,
+            settled_at: None,
             duration_ms: None,
             request_headers: headers,
             response_headers: Vec::new(),
@@ -244,12 +253,8 @@ impl PageEvents {
         }
     }
 
-    pub(crate) fn request_settled(
-        &self,
-        id: &str,
-        finished: u64,
-        settle: impl FnOnce(&mut NetworkEntry),
-    ) {
+    pub(crate) fn request_settled(&self, id: &str, settle: impl FnOnce(&mut NetworkEntry)) {
+        let finished = now_ms();
         let settled = {
             let mut history = self.lock_history();
             let entry = history
@@ -259,30 +264,27 @@ impl PageEvents {
                 .find(|entry| entry.id == id && !entry.is_settled());
             entry.map(|entry| {
                 settle(entry);
-                entry.duration_ms = Some(finished.saturating_sub(entry.started));
+                entry.settled_at = finished;
+                entry.duration_ms = finished.map(|at| at.saturating_sub(entry.started));
                 entry.clone()
             })
         };
-        if let Some(entry) = settled
-            && self.network_tx.receiver_count() > 0
-        {
-            self.network_tx.send(entry).ok();
+        if let Some(entry) = settled {
+            publish(&self.network_tx, entry);
         }
     }
 
     /// Record a request the capture script saw complete in one piece.
     pub(crate) fn push_network(&self, mut entry: NetworkEntry) {
         let mut history = self.lock_history();
-        history.next_network += 1;
+        history.next_network = history.next_network.saturating_add(1);
         entry.seq = history.next_network;
         history.network.push_back(entry.clone());
         if history.network.len() > NETWORK_CAP {
             history.network.pop_front();
         }
         drop(history);
-        if self.network_tx.receiver_count() > 0 {
-            self.network_tx.send(entry).ok();
-        }
+        publish(&self.network_tx, entry);
     }
 
     pub(crate) fn console_after(&self, seq: u64) -> Vec<ConsoleMessage> {
@@ -309,10 +311,8 @@ impl PageEvents {
             .dialog
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = dialog;
-        if let Some(dialog) = opened
-            && self.dialog_tx.receiver_count() > 0
-        {
-            self.dialog_tx.send(dialog).ok();
+        if let Some(dialog) = opened {
+            publish(&self.dialog_tx, dialog);
         }
     }
 
@@ -331,7 +331,7 @@ impl PageEvents {
         phase: LoadPhase,
     ) {
         self.navigation.send_modify(|state| {
-            state.started += 1;
+            state.started = state.started.saturating_add(1);
             state.id = id;
             state.url = url;
             state.phase = phase;
@@ -406,7 +406,13 @@ impl EventHub {
         });
         let mut tasks = Vec::new();
         // One ordered stream, so a replaced navigation's failure cannot overtake its successor's start.
-        tasks.push(spawn_navigation_stream(&hub, bidi.subscribe_raw()));
+        tasks.push(spawn_raw_stream(
+            &hub,
+            bidi.subscribe_raw(),
+            |hub, event| {
+                hub.on_navigation(event);
+            },
+        ));
         bidi.session()
             .subscribe_many(
                 [
@@ -430,41 +436,38 @@ impl EventHub {
             bidi.subscribe().await.context("subscribe log.entryAdded")?,
             |hub, event| hub.on_log(event),
         ));
-        tasks.push(spawn_stream::<BeforeRequestSentEvent>(
+        // One ordered stream, so a response cannot be handled before the request it answers.
+        tasks.push(spawn_raw_stream(
             &hub,
-            bidi.subscribe()
-                .await
-                .context("subscribe network.beforeRequestSent")?,
-            |hub, event| hub.on_request(event),
+            bidi.subscribe_raw(),
+            |hub, event| {
+                hub.on_network(event);
+            },
         ));
-        tasks.push(spawn_stream::<ResponseCompletedEvent>(
+        bidi.session()
+            .subscribe_many(
+                [
+                    BeforeRequestSentEvent::METHOD,
+                    ResponseCompletedEvent::METHOD,
+                    FetchErrorEvent::METHOD,
+                ]
+                .map(String::from),
+            )
+            .await
+            .context("subscribe network events")?;
+        // One ordered stream, so a dialog's closing cannot be handled before its
+        // opening and leave a closed dialog on record.
+        tasks.push(spawn_raw_stream(
             &hub,
-            bidi.subscribe()
-                .await
-                .context("subscribe network.responseCompleted")?,
-            |hub, event| hub.on_response(event),
+            bidi.subscribe_raw(),
+            |hub, event| {
+                hub.on_prompt(event);
+            },
         ));
-        tasks.push(spawn_stream::<FetchErrorEvent>(
-            &hub,
-            bidi.subscribe()
-                .await
-                .context("subscribe network.fetchError")?,
-            |hub, event| hub.on_fetch_error(event),
-        ));
-        tasks.push(spawn_stream::<UserPromptOpened>(
-            &hub,
-            bidi.subscribe()
-                .await
-                .context("subscribe browsingContext.userPromptOpened")?,
-            |hub, event| hub.on_prompt_opened(event),
-        ));
-        tasks.push(spawn_stream::<UserPromptClosed>(
-            &hub,
-            bidi.subscribe()
-                .await
-                .context("subscribe browsingContext.userPromptClosed")?,
-            |hub, event| hub.on_prompt_closed(event),
-        ));
+        bidi.session()
+            .subscribe_many([UserPromptOpened::METHOD, UserPromptClosed::METHOD].map(String::from))
+            .await
+            .context("subscribe browsingContext prompt events")?;
         tasks.push(spawn_stream::<ContextCreated>(
             &hub,
             bidi.subscribe()
@@ -514,23 +517,48 @@ impl EventHub {
         let Some((_, page)) = self.page_for(event.source.context.as_ref()) else {
             return;
         };
-        let location = event
+        let stack = event
             .stack_trace
             .as_ref()
-            .and_then(|trace| trace.call_frames.first())
-            .map(|frame| {
-                format!(
-                    "{}:{}:{}",
-                    frame.url,
-                    frame.line_number + 1,
-                    frame.column_number + 1
-                )
-            });
+            .map(|trace| {
+                trace
+                    .call_frames
+                    .iter()
+                    .map(|frame| {
+                        format!(
+                            "{}:{}:{}",
+                            frame.url,
+                            frame.line_number.saturating_add(1),
+                            frame.column_number.saturating_add(1)
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut text = event.text.unwrap_or_default();
         if event.kind == "javascript" && !text.starts_with("Uncaught") {
             text = format!("Uncaught {text}");
         }
-        page.push_console(event.level, text, event.timestamp, location);
+        page.push_console(event.level, text, event.timestamp, stack);
+    }
+
+    fn on_network(self: &Arc<Self>, event: RawEvent) {
+        let method = event.method.as_str();
+        let handled = match method {
+            BeforeRequestSentEvent::METHOD => {
+                decode(event.params).map(|started| self.on_request(started))
+            }
+            ResponseCompletedEvent::METHOD => {
+                decode(event.params).map(|completed| self.on_response(completed))
+            }
+            FetchErrorEvent::METHOD => {
+                decode(event.params).map(|failed| self.on_fetch_error(failed))
+            }
+            _ => return,
+        };
+        if let Err(error) = handled {
+            tracing::warn!("undecodable {method} event: {error}");
+        }
     }
 
     fn on_request(self: &Arc<Self>, event: BeforeRequestSentEvent) {
@@ -554,7 +582,7 @@ impl EventHub {
             return;
         };
         let response = event.response;
-        page.request_settled(event.request.request.as_str(), event.timestamp, |entry| {
+        page.request_settled(event.request.request.as_str(), |entry| {
             entry.status = Some(response.status);
             entry.status_text = Some(response.status_text);
             entry.mime_type = response.mime_type;
@@ -567,9 +595,25 @@ impl EventHub {
             return;
         };
         let error = event.error_text;
-        page.request_settled(event.request.request.as_str(), event.timestamp, |entry| {
+        page.request_settled(event.request.request.as_str(), |entry| {
             entry.error = Some(error);
         });
+    }
+
+    fn on_prompt(self: &Arc<Self>, event: RawEvent) {
+        let method = event.method.as_str();
+        let handled = match method {
+            UserPromptOpened::METHOD => {
+                decode(event.params).map(|opened| self.on_prompt_opened(opened))
+            }
+            UserPromptClosed::METHOD => {
+                decode(event.params).map(|closed| self.on_prompt_closed(closed))
+            }
+            _ => return,
+        };
+        if let Err(error) = handled {
+            tracing::warn!("undecodable {method} event: {error}");
+        }
     }
 
     fn on_prompt_opened(self: &Arc<Self>, event: UserPromptOpened) {
@@ -674,9 +718,7 @@ impl EventHub {
                 .parents
                 .insert(event.0.context.clone(), parent.clone());
         }
-        if self.created_tx.receiver_count() > 0 {
-            self.created_tx.send(event).ok();
-        }
+        publish(&self.created_tx, event);
     }
 
     fn on_context_destroyed(self: &Arc<Self>, event: ContextDestroyed) {
@@ -699,18 +741,30 @@ impl Drop for EventHub {
     }
 }
 
+/// Hand `event` to whoever subscribed. Nobody having subscribed is the common
+/// case, and no failure: the event is still in the page's history.
+fn publish<Event>(channel: &broadcast::Sender<Event>, event: Event) {
+    if channel.receiver_count() > 0 && channel.send(event).is_err() {
+        tracing::trace!("the last subscriber left before an event reached it");
+    }
+}
+
 fn decode<E: DeserializeOwned>(params: serde_json::Value) -> serde_json::Result<E> {
     serde_json::from_value(params)
 }
 
-fn spawn_navigation_stream(hub: &Arc<EventHub>, mut stream: RawEventStream) -> JoinHandle<()> {
+fn spawn_raw_stream(
+    hub: &Arc<EventHub>,
+    mut stream: RawEventStream,
+    handle: fn(&Arc<EventHub>, RawEvent),
+) -> JoinHandle<()> {
     let weak = Arc::downgrade(hub);
     tokio::spawn(async move {
         while let Some(event) = stream.next().await {
             let Some(hub) = weak.upgrade() else {
                 return;
             };
-            hub.on_navigation(event);
+            handle(&hub, event);
         }
     })
 }
@@ -729,4 +783,45 @@ fn spawn_stream<E: BidiEvent>(
             handle(&hub, event);
         }
     })
+}
+
+/// Milliseconds since the Unix epoch, by this machine's clock; none when the
+/// clock reads before the epoch, so no time is made up.
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DialogPolicy, PageEvents, now_ms};
+
+    #[test]
+    fn a_settled_request_carries_when_it_settled() {
+        let events = PageEvents::new(DialogPolicy::default());
+        let started = now_ms().expect("the clock reads after the epoch");
+        events.request_started(
+            "request-1".to_string(),
+            "GET".to_string(),
+            "http://127.0.0.1/api/thing".to_string(),
+            started,
+            Vec::new(),
+        );
+        let open = events.network_after(0);
+        assert_eq!(open.first().and_then(|entry| entry.settled_at), None);
+
+        events.request_settled("request-1", |entry| {
+            entry.error = Some("net::ERR_ABORTED".to_string());
+        });
+        let settled = events.network_after(0);
+        let entry = settled.first().expect("the request is on record");
+        let at = entry.settled_at.expect("a settled request says when");
+        assert!(
+            at >= started,
+            "settled at {at}, before it started at {started}"
+        );
+        assert_eq!(entry.duration_ms, Some(at.saturating_sub(started)));
+    }
 }

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Far</title>
+  <style>
+    body { margin: 0; height: 3000px; position: relative; }
+    #far-source { position: absolute; top: 40px; left: 40px; width: 120px; height: 60px; background: rgb(0, 128, 255); }
+    /* Everything between the source and the drop zone: once the page scrolls
+       down to the drop zone, the point the source held lies on this. */
+    #far-decoy { position: absolute; top: 300px; left: 0; right: 0; height: 2000px; background: rgb(255, 230, 230); }
+    #far-drop { position: absolute; top: 2400px; left: 40px; width: 240px; height: 100px; background: rgb(240, 240, 240); }
+    #far-status { position: fixed; top: 0; right: 0; }
+  </style>
+</head>
+<body>
+  <div id="far-source" draggable="true"></div>
+  <div id="far-decoy"></div>
+  <div id="far-drop"></div>
+  <div id="far-status">waiting</div>
+  <script>
+    const status = document.getElementById('far-status');
+    document.getElementById('far-source').addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'far');
+    });
+    document.getElementById('far-decoy').addEventListener('pointerdown', () => {
+      status.textContent = 'pressed the decoy';
+    });
+    const drop = document.getElementById('far-drop');
+    drop.addEventListener('dragover', (event) => event.preventDefault());
+    drop.addEventListener('drop', (event) => {
+      event.preventDefault();
+      if (status.textContent === 'waiting') status.textContent = 'dropped';
+    });
+    window.__appReady = true;
+  </script>
+</body>
+</html>

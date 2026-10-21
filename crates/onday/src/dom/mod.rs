@@ -14,9 +14,8 @@ mod wait;
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
-use thirtyfour::prelude::*;
+use thirtyfour::prelude::WebElement;
 
-pub use crate::js::SCROLL_TO_TARGET_VIA_SCROLLBAR;
 pub use wait::wait_until_interactable;
 
 /// Escape a string for a double-quoted HTML attribute value inside a CSS selector.
@@ -120,48 +119,4 @@ pub trait WebDriverExt {
 /// Escape a string for a single-quoted JS string literal.
 fn escape_js_single(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-/// Whether every typed character appears in `landed`, in order. A mask's own
-/// separators may sit between them; WebDriver key codepoints are keys, not text.
-fn typed_in_order(typed: &str, landed: &str) -> bool {
-    let mut remaining = landed.chars();
-    typed
-        .chars()
-        .filter(|character| !('\u{e000}'..='\u{f8ff}').contains(character))
-        .all(|character| remaining.any(|held| held == character))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::typed_in_order;
-    use thirtyfour::prelude::Key;
-
-    #[test]
-    fn exact_text_is_in_order() {
-        assert!(typed_in_order("hello", "hello"));
-        assert!(typed_in_order("", ""));
-    }
-
-    #[test]
-    fn mask_separators_are_tolerated() {
-        assert!(typed_in_order("5551234567", "(555) 123-4567"));
-        assert!(typed_in_order("1234.5", "1,234.50"));
-    }
-
-    #[test]
-    fn a_dropped_character_fails() {
-        assert!(!typed_in_order("5551234567", "(555) 123-456"));
-    }
-
-    #[test]
-    fn a_reordered_value_fails() {
-        assert!(!typed_in_order("abc", "acb"));
-    }
-
-    #[test]
-    fn key_codepoints_are_skipped() {
-        let typed = format!("ab{}", char::from(Key::Tab));
-        assert!(typed_in_order(&typed, "ab"));
-    }
 }

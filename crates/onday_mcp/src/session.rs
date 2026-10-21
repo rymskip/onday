@@ -221,11 +221,11 @@ impl SessionDir {
             (None, None) => "pending".to_string(),
         };
         let line = format!(
-            "{} {} {} -> {outcome} ({}ms)",
+            "{} {} {} -> {outcome}{}",
             entry.started,
             entry.method,
             entry.url,
-            entry.duration_ms.unwrap_or(0)
+            settled_note(entry)
         );
         write_line(&self.network_log, &line);
     }
@@ -275,9 +275,9 @@ fn now() -> Result<String> {
 fn validate_id(id: String) -> Result<String> {
     let valid = !id.is_empty()
         && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
         && !id.starts_with('.');
     if !valid {
         bail!("session id {id:?} must be 1-64 letters, digits, '-', '_' or '.'");
@@ -293,6 +293,16 @@ fn generated_id() -> Result<String> {
         .context("format the session id")?;
     let salt = RandomState::new().hash_one(std::process::id()) & 0xffff;
     Ok(format!("{stamp}-{salt:04x}"))
+}
+
+/// When a request settled and how long it took, both milliseconds; nothing
+/// for one still pending, rather than a duration it does not have yet.
+pub fn settled_note(entry: &NetworkEntry) -> String {
+    match (entry.settled_at, entry.duration_ms) {
+        (Some(at), Some(took)) => format!(" (settled {at}, {took}ms)"),
+        (Some(at), None) => format!(" (settled {at})"),
+        (None, _) => String::new(),
+    }
 }
 
 #[cfg(test)]

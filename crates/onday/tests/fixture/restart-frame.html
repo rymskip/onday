@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Restarting</title>
+</head>
+<body>
+  <input id="restart-input" aria-label="Card number">
+  <p id="restart-status">starting</p>
+  <script>
+    // Replaces its own document a number of times before it settles, as a
+    // payment field's frame does while it starts.
+    const left = Number(new URLSearchParams(location.search).get('left') ?? '0');
+    if (left > 0) {
+      setTimeout(() => location.replace('/restart-frame?left=' + (left - 1)), 40);
+    } else {
+      document.getElementById('restart-status').textContent = 'settled';
+    }
+  </script>
+</body>
+</html>

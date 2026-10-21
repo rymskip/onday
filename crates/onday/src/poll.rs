@@ -75,7 +75,7 @@ where
         let elapsed = start.elapsed();
         if elapsed >= next_report {
             on_progress(elapsed);
-            next_report = elapsed + Duration::from_secs(5);
+            next_report = elapsed.saturating_add(Duration::from_secs(5));
         }
         // Checked after the probe so a zero budget still tries once.
         if elapsed > budget {
@@ -104,7 +104,7 @@ where
         match probe().await {
             Ok(Some(value)) => return Ok(value),
             Ok(None) => {}
-            Err(e) => last_error = Some(e),
+            Err(error) => last_error = Some(error),
         }
         if start.elapsed() > budget {
             return Err(last_error);
@@ -140,12 +140,12 @@ mod tests {
 
     #[test]
     fn growth_is_capped() {
-        let b = Backoff::FAST;
-        let mut gap = b.start;
+        let backoff = Backoff::FAST;
+        let mut gap = backoff.start;
         for _ in 0..100 {
-            gap = b.next_gap(gap);
+            gap = backoff.next_gap(gap);
         }
-        assert_eq!(gap, b.max);
+        assert_eq!(gap, backoff.max);
     }
 
     #[test]

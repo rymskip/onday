@@ -32,8 +32,10 @@ pub mod warm;
 pub mod webauthn;
 
 mod frame;
+mod mapper;
 mod proto;
 mod snapshot;
+mod typing;
 
 pub use browser::Browser;
 pub use channel::{BrowserGone, Health};
@@ -44,7 +46,9 @@ pub use events::{ConsoleMessage, Dialog, DialogPolicy, Header, NetworkEntry};
 pub use expect::{LocatorAssertions, PageAssertions, expect, expect_page};
 pub use hooks::{AppHooks, DefaultHooks};
 pub use launch::{DriverSource, LaunchOptions, PromptBehavior, Protocol, ProtocolPreference};
-pub use locator::{ClickOptions, ElementInfo, ElementState, Locator, StrictModeViolation};
+pub use locator::{
+    BoundingBox, ClickOptions, ElementInfo, ElementState, Locator, StrictModeViolation,
+};
 pub use page::{Keyboard, Mouse, MouseButton, Page, ScreenshotOptions, WaitUntil};
 pub use poll::{Backoff, poll_until, poll_until_blocking, poll_until_ok, poll_until_reporting};
 pub use route::{Fulfill, InterceptedRequest, RouteAction, RouteHandler};

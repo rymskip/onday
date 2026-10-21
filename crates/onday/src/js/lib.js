@@ -626,10 +626,6 @@
         return { ok: true, rect: [rect.x, rect.y, rect.width, rect.height] };
     }
 
-    function prescroll(el) {
-        /*__PRESCROLL__*/
-    }
-
     function deepHit(doc, x, y) {
         let hit = doc.elementFromPoint(x, y);
         while (hit && hit.shadowRoot) {
@@ -659,7 +655,10 @@
         const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
         const hit = deepHit(document, x, y);
         if (!hit) return { ok: false, reason: 'nothing at (' + x + ', ' + y + ')', x, y, outside: false };
-        if (composedContains(el, hit) || composedContains(hit, el)) return { ok: true, reason: '', x, y, outside: false };
+        // As Playwright's hit-target check: only the target or something inside it
+        // counts. An ancestor answering means the point is not on the target, as when
+        // the target's own scroll box clips it and the page behind takes the point.
+        if (composedContains(el, hit)) return { ok: true, reason: '', x, y, outside: false };
         if (hit.tagName === 'LABEL' && hit.control === el) return { ok: true, reason: '', x, y, outside: false };
         return { ok: false, reason: describe(hit) + ' intercepts pointer events at (' + x + ', ' + y + ')', x, y, outside: false };
     }
@@ -697,8 +696,301 @@
         return frameHit(frame, x, y);
     }
 
+    // Whether all of `el` shows: inside the viewport and inside every ancestor
+    // that clips what overflows it.
+    function fullyInView(el) {
+        const rect = el.getBoundingClientRect();
+        const holds = (box) =>
+            rect.top >= box.top && rect.bottom <= box.bottom &&
+            rect.left >= box.left && rect.right <= box.right;
+        if (!holds({ top: 0, left: 0, bottom: window.innerHeight, right: window.innerWidth })) {
+            return false;
+        }
+        for (let box = el.parentElement; box; box = box.parentElement) {
+            const style = getComputedStyle(box);
+            const clips = `${style.overflowX} ${style.overflowY}`;
+            if (/auto|scroll|hidden|clip/.test(clips) && !holds(box.getBoundingClientRect())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Scroll `el` into view only when it is out of it, centred, as Playwright
+    // does through Chromium's `DOM.scrollIntoViewIfNeeded`. Firefox has no
+    // native call, so the same check runs here: a scroll the target did not
+    // need can close the menu it sits in.
     function scrollIntoViewIfNeeded(el) {
+        if (typeof el.scrollIntoViewIfNeeded === 'function') {
+            el.scrollIntoViewIfNeeded(true);
+            return;
+        }
+        if (fullyInView(el)) return;
         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    }
+
+    // Scroll every box holding `el` so it sits at `block` (start, center or
+    // end), or with `null` only as far as it is out of view.
+    function scrollAligned(el, block) {
+        if (block === null) {
+            scrollIntoViewIfNeeded(el);
+            return;
+        }
+        el.scrollIntoView({ block, inline: block, behavior: 'instant' });
+    }
+
+    // ── pointer actions, as Playwright's ──────────────────────────────────
+    // Ports of Playwright's injected script for its pointer actions:
+    // `retarget`, `checkElementStates`, `_clickablePoint`, `expectHitTarget`
+    // and `setupHitTargetInterceptor`.
+
+    function parentElementOrShadowHost(element) {
+        if (element.parentElement) return element.parentElement;
+        if (!element.parentNode) return undefined;
+        if (element.parentNode.nodeType === 11 && element.parentNode.host) return element.parentNode.host;
+        return undefined;
+    }
+
+    function enclosingShadowRootOrDocument(element) {
+        let node = element;
+        while (node.parentNode) node = node.parentNode;
+        if (node.nodeType === 11 || node.nodeType === 9) return node;
+        return undefined;
+    }
+
+    function retarget(node, behavior) {
+        let element = node.nodeType === 1 ? node : node.parentElement;
+        if (!element) return null;
+        if (behavior === 'none') return element;
+        if (!element.matches('input, textarea, select') && !element.isContentEditable) {
+            if (behavior === 'button-link') element = element.closest('button, [role=button], a, [role=link]') || element;
+            else element = element.closest('button, [role=button], [role=checkbox], [role=radio]') || element;
+        }
+        if (behavior === 'follow-label') {
+            if (!element.matches('a, input, textarea, button, select, [role=link], [role=button], [role=checkbox], [role=radio]') && !element.isContentEditable) {
+                const enclosingLabel = element.closest('label');
+                if (enclosingLabel && enclosingLabel.control) element = enclosingLabel.control;
+            }
+        }
+        return element;
+    }
+
+    function isVisibleTextNode(node) {
+        const range = node.ownerDocument.createRange();
+        range.selectNode(node);
+        const rect = range.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function isStyleVisibilityVisible(element, style) {
+        if (typeof element.checkVisibility === 'function' && !element.checkVisibility()) return false;
+        return style.visibility === 'visible';
+    }
+
+    function isElementVisible(element) {
+        const style = getComputedStyle(element);
+        if (style.display === 'contents') {
+            for (let child = element.firstChild; child; child = child.nextSibling) {
+                if (child.nodeType === 1 && isElementVisible(child)) return true;
+                if (child.nodeType === 3 && isVisibleTextNode(child)) return true;
+            }
+            return false;
+        }
+        if (!isStyleVisibilityVisible(element, style)) return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    const ARIA_DISABLED_ROLES = new Set(['application', 'button', 'composite', 'gridcell', 'group', 'input', 'link', 'menuitem', 'scrollbar', 'separator', 'tab', 'checkbox', 'columnheader', 'combobox', 'grid', 'listbox', 'menu', 'menubar', 'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'radiogroup', 'row', 'rowheader', 'searchbox', 'select', 'slider', 'spinbutton', 'switch', 'tablist', 'textbox', 'toolbar', 'tree', 'treegrid', 'treeitem']);
+
+    function isNativelyDisabled(element) {
+        const tag = element.tagName;
+        if (!['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'OPTION', 'OPTGROUP'].includes(tag)) return false;
+        if (element.hasAttribute('disabled')) return true;
+        if (tag === 'OPTION' && element.closest('OPTGROUP[DISABLED]')) return true;
+        const fieldSet = element.closest('FIELDSET[DISABLED]');
+        if (!fieldSet) return false;
+        const legend = fieldSet.querySelector(':scope > LEGEND');
+        return !legend || !legend.contains(element);
+    }
+
+    function hasAriaDisabledInChain(element) {
+        const attribute = (element.getAttribute('aria-disabled') || '').toLowerCase();
+        if (attribute === 'true') return true;
+        if (attribute === 'false') return false;
+        const parent = parentElementOrShadowHost(element);
+        return parent ? hasAriaDisabledInChain(parent) : false;
+    }
+
+    function isAriaDisabled(element) {
+        if (isNativelyDisabled(element)) return true;
+        return ARIA_DISABLED_ROLES.has(getRole(element) || '') && hasAriaDisabledInChain(element);
+    }
+
+    function topmostModalDialog(document) {
+        let dialogs;
+        try { dialogs = document.querySelectorAll('dialog:modal'); } catch (error) { return undefined; }
+        if (!dialogs.length) return undefined;
+        const dialog = dialogs[dialogs.length - 1];
+        const ancestors = new Set();
+        for (let element = parentElementOrShadowHost(dialog); element; element = parentElementOrShadowHost(element)) ancestors.add(element);
+        return { dialog, ancestors };
+    }
+
+    function isElementInert(element) {
+        if (element.hasAttribute('inert')) return true;
+        const modal = topmostModalDialog(element.ownerDocument);
+        if (modal && element === modal.dialog) return false;
+        const parent = parentElementOrShadowHost(element);
+        if (parent) return isElementInert(parent);
+        return element.isConnected && !!modal;
+    }
+
+    // As `checkElementStates`: stable first, over animation frames, then the rest.
+    function elementIsStable(node) {
+        return new Promise((resolve) => {
+            let lastRect;
+            const check = () => {
+                const element = retarget(node, 'no-follow-label');
+                if (!element || !element.isConnected) return resolve('notconnected');
+                const box = element.getBoundingClientRect();
+                const rect = [box.top, box.left, box.width, box.height];
+                if (lastRect) return resolve(rect.every((value, index) => value === lastRect[index]));
+                lastRect = rect;
+                requestAnimationFrame(check);
+            };
+            requestAnimationFrame(check);
+        });
+    }
+
+    async function pointerStates(node, requireEnabled) {
+        const stable = await elementIsStable(node);
+        if (stable === 'notconnected') return 'notconnected';
+        if (!stable) return 'stable';
+        const visible = retarget(node, 'none');
+        if (!visible || !visible.isConnected) return 'notconnected';
+        if (!isElementVisible(visible)) return 'visible';
+        if (requireEnabled) {
+            const element = retarget(node, 'follow-label');
+            if (!element || !element.isConnected) return 'notconnected';
+            if (isAriaDisabled(element)) return 'enabled';
+            if (isElementInert(element)) return 'non-inert';
+        }
+        return 'ok';
+    }
+
+    // As `_clickablePoint` over BiDi: the middle of the first client rect that
+    // keeps an area once clipped to the viewport.
+    function clickablePoint(el) {
+        if (!el || !el.isConnected) return { ok: false, reason: 'detached from the document', x: 0, y: 0, outside: false };
+        const rects = [...el.getClientRects()];
+        if (!rects.length) return { ok: false, reason: 'not visible', x: 0, y: 0, outside: false };
+        const width = window.innerWidth, height = window.innerHeight;
+        for (const rect of rects) {
+            const left = Math.min(Math.max(rect.left, 0), width), right = Math.min(Math.max(rect.right, 0), width);
+            const top = Math.min(Math.max(rect.top, 0), height), bottom = Math.min(Math.max(rect.bottom, 0), height);
+            if ((right - left) * (bottom - top) > 0.99) {
+                return { ok: true, reason: '', x: Math.round((left + right) / 2), y: Math.round((top + bottom) / 2), outside: false };
+            }
+        }
+        return { ok: false, reason: 'outside of the viewport', x: Math.round(rects[0].left), y: Math.round(rects[0].top), outside: true };
+    }
+
+    function expectHitTarget(hitPoint, targetElement) {
+        const roots = [];
+        let parentElement = targetElement;
+        while (parentElement) {
+            const root = enclosingShadowRootOrDocument(parentElement);
+            if (!root) break;
+            roots.push(root);
+            if (root.nodeType === 9) break;
+            parentElement = root.host;
+        }
+        let hitElement;
+        for (let index = roots.length - 1; index >= 0; index--) {
+            const root = roots[index];
+            const elements = root.elementsFromPoint(hitPoint.x, hitPoint.y);
+            const singleElement = root.elementFromPoint(hitPoint.x, hitPoint.y);
+            if (singleElement && elements[0] && parentElementOrShadowHost(singleElement) === elements[0]) {
+                if (getComputedStyle(singleElement).display === 'contents') elements.unshift(singleElement);
+            }
+            if (elements[0] && elements[1] === singleElement && roots.slice(index).some((candidate) => candidate.host === elements[0])) elements.shift();
+            const innerElement = elements[0];
+            if (!innerElement) break;
+            hitElement = innerElement;
+            if (index && innerElement !== roots[index - 1].host) break;
+        }
+        const hitParents = [];
+        while (hitElement && hitElement !== targetElement) {
+            hitParents.push(hitElement);
+            hitElement = hitElement.assignedSlot || parentElementOrShadowHost(hitElement);
+        }
+        if (hitElement === targetElement) return 'done';
+        let description = describe(hitParents[0] || document.documentElement);
+        for (let element = targetElement; element; element = parentElementOrShadowHost(element)) {
+            const index = hitParents.indexOf(element);
+            if (index !== -1) {
+                if (index > 1) description += ' from ' + describe(hitParents[index - 1]) + ' subtree';
+                break;
+            }
+        }
+        return description + ' intercepts pointer events';
+    }
+
+    // As `setupHitTargetInterceptor`: the hit at the aimed point checked first,
+    // then the action's first trusted event checked at its own point, and the
+    // gesture blocked when it lands off the target. A drop is checked only at
+    // the point: the dragged element often stays under the cursor.
+    const GUARDED = {
+        hover: new Set(['mousemove']),
+        mouse: new Set(['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'click', 'auxclick', 'dblclick', 'contextmenu']),
+    };
+
+    // onday's own allowance, for typing only: a click on the label bound to a
+    // field is a click on the field. Playwright has no clicking action for typing.
+    function hitsField(point, element, followLabel) {
+        const result = expectHitTarget(point, element);
+        if (result === 'done' || !followLabel) return result;
+        const hit = deepHit(document, point.x, point.y);
+        const label = hit && hit.closest ? hit.closest('label') : null;
+        return label && label.control === element ? 'done' : result;
+    }
+
+    function guardHits(node, kind, x, y, followLabel) {
+        const element = retarget(node, 'button-link');
+        if (!element || !element.isConnected) return 'detached from the document';
+        const preliminary = hitsField({ x, y }, element, followLabel);
+        if (preliminary !== 'done') return preliminary;
+        window.__ondayHitGuard = null;
+        if (kind === 'drag') return 'done';
+        if (!window.__ondayHitGuardInstalled) {
+            const forward = (event) => { if (window.__ondayHitGuard) window.__ondayHitGuard.listener(event); };
+            for (const type of new Set([...GUARDED.hover, ...GUARDED.mouse])) {
+                window.addEventListener(type, forward, { capture: true, passive: false });
+            }
+            window.__ondayHitGuardInstalled = true;
+        }
+        const events = GUARDED[kind];
+        const guard = { result: undefined, listener: null };
+        guard.listener = (event) => {
+            if (!events.has(event.type) || !event.isTrusted) return;
+            if (guard.result === undefined) guard.result = hitsField({ x: event.clientX, y: event.clientY }, element, followLabel);
+            if (guard.result !== 'done') {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+            }
+        };
+        window.__ondayHitGuard = guard;
+        return 'done';
+    }
+
+    // What the guard found, and the guard lifted. No event at all counts as a
+    // hit, as in Playwright: a disabled control or an overlaying frame fires none.
+    function endHitGuard() {
+        const guard = window.__ondayHitGuard;
+        window.__ondayHitGuard = null;
+        return guard && guard.result !== undefined ? guard.result : 'done';
     }
 
     // ── drag and drop ─────────────────────────────────────────────────────
@@ -709,19 +1001,32 @@
         return el.closest('[draggable="true"]');
     }
 
-    // A native drag counts only once it ends: Firefox starts one from WebDriver input
-    // and then never delivers its drop or dragend.
+    // A native drag counts only once it is delivered: Firefox starts one from
+    // WebDriver input and then never delivers its drop or dragend. The trusted
+    // drop counts as well as the dragend: a page that re-renders its source on
+    // drop detaches it, and a detached source's dragend never reaches the window.
     function watchDrag() {
-        window.__ondayNativeDrag = false;
-        window.addEventListener('dragend', (e) => { if (e.isTrusted) window.__ondayNativeDrag = true; }, { capture: true, once: true });
+        const previous = window.__ondayNativeDrag;
+        if (previous && previous.seen) {
+            for (const type of ['dragstart', 'drop', 'dragend']) window.removeEventListener(type, previous.seen, { capture: true });
+        }
+        const state = { started: false, ended: false, seen: null };
+        state.seen = (event) => {
+            if (!event.isTrusted) return;
+            if (event.type === 'dragstart') state.started = true;
+            else state.ended = true;
+        };
+        for (const type of ['dragstart', 'drop', 'dragend']) window.addEventListener(type, state.seen, { capture: true });
+        window.__ondayNativeDrag = state;
     }
 
-    function nativeDragEnded(waitMs) {
+    // Whether a trusted drag started, and whether it ended within `waitMs`.
+    function nativeDrag(waitMs) {
         return new Promise((resolve) => {
             const started = Date.now();
             const check = () => {
-                if (window.__ondayNativeDrag === true) resolve(true);
-                else if (Date.now() - started >= waitMs) resolve(false);
+                const state = window.__ondayNativeDrag || { started: false, ended: false };
+                if (state.ended || Date.now() - started >= waitMs) resolve({ started: state.started, ended: state.ended });
                 else setTimeout(check, 25);
             };
             check();
@@ -744,7 +1049,7 @@
         return { started: true, items, effectAllowed: dataTransfer.effectAllowed };
     }
 
-    // Returns the drop effect, or 'none' when the element under the point refused it.
+    // The drop effect, or 'none' with the element under the point that refused it.
     function dropAt(el, x, y, items, effectAllowed) {
         const target = deepHit(document, x, y) || el;
         const dataTransfer = new DataTransfer();
@@ -753,10 +1058,10 @@
         target.dispatchEvent(new DragEvent('dragenter', dragInit(dataTransfer, x, y, true)));
         if (target.dispatchEvent(new DragEvent('dragover', dragInit(dataTransfer, x, y, true)))) {
             target.dispatchEvent(new DragEvent('dragleave', dragInit(dataTransfer, x, y, false)));
-            return 'none';
+            return { effect: 'none', refusedBy: describe(target) };
         }
         target.dispatchEvent(new DragEvent('drop', dragInit(dataTransfer, x, y, true)));
-        return dataTransfer.dropEffect === 'none' ? 'move' : dataTransfer.dropEffect;
+        return { effect: dataTransfer.dropEffect === 'none' ? 'move' : dataTransfer.dropEffect, refusedBy: null };
     }
 
     function endDrag(x, y, dropEffect) {
@@ -812,8 +1117,9 @@
             // An emptied editable keeps a placeholder <br>, which reads as one newline.
             text = el.innerText.replace(/\n$/, '');
         }
-        const r = el.getBoundingClientRect();
-        const onTop = deepHit(document, r.left + r.width / 2, r.top + r.height / 2);
+        // What is on top where a click aims.
+        const aim = hitPoint(el);
+        const onTop = deepHit(document, aim.x, aim.y);
         return {
             kind,
             type,
@@ -958,15 +1264,19 @@
         byRef,
         refFor,
         probe,
-        prescroll,
         hitPoint,
         frameOffset,
         frameHit,
         revealFrame,
         scrollIntoViewIfNeeded,
+        scrollAligned,
+        pointerStates,
+        clickablePoint,
+        guardHits,
+        endHitGuard,
         dragSource,
         watchDrag,
-        nativeDragEnded,
+        nativeDrag,
         startDrag,
         dropAt,
         endDrag,

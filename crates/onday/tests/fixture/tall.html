@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tall</title>
+  <style>
+    body { margin: 0; display: flex; gap: 40px; padding: 40px; }
+    #tall-source { width: 120px; height: 60px; background: rgb(0, 128, 255); }
+    /* A drop zone four times taller than the box that scrolls it, the way a
+       long sidebar list is. */
+    #tall-box { width: 240px; height: 300px; overflow: auto; }
+    #tall-drop { height: 1200px; background: rgb(240, 240, 240); }
+  </style>
+</head>
+<body>
+  <div id="tall-source" draggable="true"></div>
+  <div id="tall-box"><div id="tall-drop"></div></div>
+  <div id="tall-status">waiting</div>
+  <script>
+    const drop = document.getElementById('tall-drop');
+    document.getElementById('tall-source').addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'tall');
+    });
+    drop.addEventListener('dragover', (event) => event.preventDefault());
+    // The drop re-renders the source away, the way a list moves a card it
+    // just placed: its dragend never reaches the window.
+    drop.addEventListener('drop', (event) => {
+      event.preventDefault();
+      document.getElementById('tall-source').remove();
+      document.getElementById('tall-status').textContent = 'dropped';
+    });
+    window.__appReady = true;
+  </script>
+</body>
+</html>

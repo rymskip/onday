@@ -47,6 +47,17 @@ second line</textarea>
       <input id="covered" aria-label="Covered" value="">
       <div id="toast" style="position: absolute; inset: 0; background: #fc0">Saved</div>
     </div>
+    <div style="height: 60px; width: 220px; overflow: hidden">
+      <div style="height: 50px"></div>
+      <input id="clipped" aria-label="Clipped" value="" style="height: 40px; box-sizing: border-box">
+      <div style="height: 100px"></div>
+    </div>
+    <div id="beneath" style="height: 40px; width: 220px">Beneath</div>
+    <div id="pad" aria-label="Pad" style="width: 200px; height: 80px; background: #eee; touch-action: none"
+      onpointerdown="window.__stroke = ['down']"
+      onpointermove="if (window.__stroke) window.__stroke.push('move')"
+      onpointerup="if (window.__stroke) window.__stroke.push('up')"></div>
+    <div id="scroller" style="height: 80px; width: 200px; overflow-y: scroll"><div style="height: 600px">Tall</div></div>
     <input id="upload" type="file" style="display:none">
     <button id="alert-btn" onclick="document.getElementById('status').textContent = confirm('Proceed?') ? 'confirmed' : 'cancelled'">Ask</button>
     <button id="fetch-btn" onclick="load()">Load data</button>
