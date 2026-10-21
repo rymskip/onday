@@ -218,20 +218,30 @@ pub fn glob_matches(pattern: &str, url: &str) -> bool {
 }
 
 fn matches_from(pattern: &[char], text: &[char]) -> bool {
-    match pattern.first() {
-        None => text.is_empty(),
-        Some('*') if pattern.get(1) == Some(&'*') => {
-            let rest = &pattern[2..];
-            (0..=text.len()).any(|skip| matches_from(rest, &text[skip..]))
+    match pattern {
+        [] => text.is_empty(),
+        ['*', '*', rest @ ..] => tails(text, text.len()).any(|tail| matches_from(rest, tail)),
+        ['*', rest @ ..] => {
+            let limit = text
+                .iter()
+                .position(|character| *character == '/')
+                .unwrap_or(text.len());
+            tails(text, limit).any(|tail| matches_from(rest, tail))
         }
-        Some('*') => {
-            let rest = &pattern[1..];
-            let limit = text.iter().position(|c| *c == '/').unwrap_or(text.len());
-            (0..=limit).any(|skip| matches_from(rest, &text[skip..]))
-        }
-        Some('?') => !text.is_empty() && matches_from(&pattern[1..], &text[1..]),
-        Some(c) => text.first() == Some(c) && matches_from(&pattern[1..], &text[1..]),
+        ['?', rest @ ..] => match text {
+            [_, tail @ ..] => matches_from(rest, tail),
+            [] => false,
+        },
+        [expected, rest @ ..] => match text {
+            [found, tail @ ..] => found == expected && matches_from(rest, tail),
+            [] => false,
+        },
     }
+}
+
+/// `text` with none, one, and so on up to `limit` of its leading characters skipped.
+fn tails(text: &[char], limit: usize) -> impl Iterator<Item = &[char]> {
+    (0..=limit).filter_map(|skip| text.get(skip..))
 }
 
 #[cfg(test)]

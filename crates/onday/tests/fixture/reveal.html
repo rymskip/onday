@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Reveal</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    .filler { height: 60vh; }
+    #reveal-menu { border: 1px solid #999; padding: 8px; width: 200px; }
+    .tail { height: 2000px; }
+  </style>
+</head>
+<body>
+  <div class="filler"></div>
+  <!-- Visible but below the viewport's centre, and closed by any scroll, as
+       a popover menu is: a click that scrolled its item first would close it. -->
+  <div id="reveal-menu">
+    <button id="reveal-action">Action</button>
+  </div>
+  <p id="reveal-status">idle</p>
+  <div class="tail"></div>
+  <script>
+    let clicks = 0;
+    document.getElementById('reveal-action').addEventListener('click', () => {
+      clicks++;
+      document.getElementById('reveal-status').textContent = 'clicked ' + clicks;
+    });
+    addEventListener('scroll', () => document.getElementById('reveal-menu')?.remove(), { once: true });
+    window.__appReady = true;
+  </script>
+</body>
+</html>

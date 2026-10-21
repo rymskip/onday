@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cover</title>
+  <style>
+    body { margin: 0; height: 600px; display: flex; align-items: center; justify-content: center; }
+    #cover-target { width: 160px; height: 60px; }
+    #cover { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, 0.2); }
+    #cover-status { position: fixed; top: 0; left: 0; }
+  </style>
+</head>
+<body>
+  <button id="cover-target" type="button">Target</button>
+  <div id="cover-status">waiting</div>
+  <script>
+    const status = document.getElementById('cover-status');
+    let clicks = 0;
+    document.getElementById('cover-target').addEventListener('click', () => {
+      clicks += 1;
+      status.textContent = 'clicked ' + clicks;
+    });
+    // The first press anywhere covers the page for a moment, the way a menu's
+    // backdrop opens under a pointer that is already on its way down.
+    window.addEventListener('pointerdown', () => {
+      const cover = document.createElement('div');
+      cover.id = 'cover';
+      cover.addEventListener('click', () => { status.textContent = 'clicked the cover'; });
+      document.body.appendChild(cover);
+      setTimeout(() => cover.remove(), 300);
+    }, { capture: true, once: true });
+    window.__appReady = true;
+  </script>
+</body>
+</html>

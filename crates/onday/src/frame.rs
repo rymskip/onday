@@ -59,21 +59,23 @@ impl FrameRegistry {
             .frames
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let index = match frames.iter().position(|known| known.target == target) {
-            Some(index) => index,
-            None => {
-                let prefix = format!("f{}", frames.len() + 1);
-                frames.push(Frame {
-                    target: target.clone(),
-                    prefix,
-                    host: None,
-                });
-                frames.len() - 1
-            }
-        };
         // The latest host wins: the element that showed the frame may have been replaced.
-        frames[index].host = Some(Box::new(host));
-        frames[index].clone()
+        let host = Some(Box::new(host));
+        match frames.iter_mut().find(|known| known.target == target) {
+            Some(known) => {
+                known.host = host;
+                known.clone()
+            }
+            None => {
+                let frame = Frame {
+                    target: target.clone(),
+                    prefix: format!("f{}", frames.len().saturating_add(1)),
+                    host,
+                };
+                frames.push(frame.clone());
+                frame
+            }
+        }
     }
 
     pub(crate) fn by_prefix(&self, prefix: &str) -> Result<Frame> {

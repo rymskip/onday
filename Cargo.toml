@@ -3,14 +3,14 @@ resolver = "3"
 members = ["crates/onday", "crates/onday_mcp"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://gitlab.com/rymskip/onday"
 
 [workspace.dependencies]
-onday = { path = "crates/onday", version = "0.3.0" }
+onday = { path = "crates/onday", version = "0.4.0" }
 anyhow = "1.0"
 base64 = "0.23.1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -25,3 +25,45 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Nothing panics on what a browser, a driver or a caller can cause.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+# No `as` that can truncate, wrap, drop a sign or lose precision.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+# Overflow is chosen, not inherited from the build profile.
+arithmetic_side_effects = "deny"
+# A wildcard that stands for one variant names it.
+match_wildcard_for_single_variants = "deny"
+# A failure is not an absence, and a discarded one is a failure nobody sees.
+unused_result_ok = "deny"
+map_err_ignore = "deny"
+let_underscore_must_use = "deny"
+let_underscore_future = "deny"
+# A run of bool arguments says nothing at the call site.
+fn_params_excessive_bools = "deny"
+# No guard is held across an await.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+# A name says what it holds, and an import says where it comes from.
+min_ident_chars = "deny"
+wildcard_imports = "deny"
+enum_glob_use = "deny"
+# Warnings are fixed, never allowed.
+allow_attributes = "deny"

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use thirtyfour::prelude::*;
+use thirtyfour::prelude::WebDriver;
 
 use super::runtime::call_lib;
 use crate::poll::{Backoff, poll_until};

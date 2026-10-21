@@ -41,16 +41,18 @@ pub fn key_value(name: &str) -> Result<String> {
             }
         }
         other => {
-            if let Some(number) = other.strip_prefix('F').and_then(|n| n.parse::<u32>().ok())
+            if let Some(number) = other
+                .strip_prefix('F')
+                .and_then(|digits| digits.parse::<u32>().ok())
                 && (1..=12).contains(&number)
             {
-                return Ok(char::from_u32(0xE031 + number - 1)
+                return Ok(char::from_u32(0xE030_u32.saturating_add(number))
                     .map(String::from)
                     .unwrap_or_default());
             }
             let mut chars = other.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) => c,
+                (Some(character), None) => character,
                 _ => bail!("unknown key {other:?}"),
             }
         }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use http::Method;
 use serde::Serialize;
 use thirtyfour::common::command::FormatRequestData;
-use thirtyfour::prelude::*;
+use thirtyfour::prelude::WebDriver;
 use thirtyfour::{RequestData, SessionId};
 
 /// Options for [`add_virtual_authenticator`]. The default models a platform

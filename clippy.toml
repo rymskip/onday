@@ -1,0 +1,13 @@
+# A single letter is not a name, whichever letter it is.
+min-ident-chars-threshold = 1
+allowed-idents-below-min-chars = []
+
+# The lint otherwise allows `pub use` globs, prelude globs, and
+# `use super::*` inside a test module.
+warn-on-all-wildcard-imports = true
+
+# A test states what it expects, and failing loudly is how it reports.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

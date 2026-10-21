@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
-use thirtyfour::prelude::*;
+use thirtyfour::prelude::WebDriver;
 
 use crate::js;
 

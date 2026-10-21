@@ -36,6 +36,7 @@ pub(crate) struct Session {
 impl Session {
     async fn open(
         endpoint: Endpoint,
+        engine: Engine,
         caps: &Capabilities,
         preference: ProtocolPreference,
     ) -> Result<Session> {
@@ -70,6 +71,12 @@ impl Session {
         } else {
             None
         };
+        if bidi.is_some() && engine == Engine::Chromium {
+            // A driver that keeps its mapper somewhere else has no log to remove.
+            if let Err(error) = crate::mapper::silence_log(&driver).await {
+                tracing::warn!("the BiDi mapper tab keeps its log: {error:#}");
+            }
+        }
         let hub = match &bidi {
             Some(bidi) => Some(
                 EventHub::start(bidi.clone())
@@ -176,7 +183,7 @@ impl BrowserInner {
     /// Another session with its own driver: some drivers (geckodriver) hold one session each.
     pub(crate) async fn open_session(&self) -> Result<Session> {
         let endpoint = endpoint_for(&self.options).await?;
-        Session::open(endpoint, &self.caps, self.options.protocol).await
+        Session::open(endpoint, self.engine, &self.caps, self.options.protocol).await
     }
 }
 
@@ -201,7 +208,7 @@ impl Browser {
         let engine = options.engine;
         let caps = engine.capabilities(&options)?;
         let endpoint = endpoint_for(&options).await?;
-        let primary = Session::open(endpoint, &caps, options.protocol)
+        let primary = Session::open(endpoint, engine, &caps, options.protocol)
             .await
             .with_context(|| format!("launch {engine}"))?;
         if let (Some((width, height)), true) = (options.window_size, engine != Engine::Chromium) {
@@ -305,7 +312,7 @@ async fn endpoint_for(options: &LaunchOptions) -> Result<Endpoint> {
         Engine::Webkit => {
             let binary = match &options.driver {
                 DriverSource::Binary(path) => path.clone(),
-                _ => find_on_path("WebKitWebDriver").context(
+                DriverSource::Managed | DriverSource::Remote(_) => find_on_path("WebKitWebDriver").context(
                     "webkit needs WebKitWebDriver (install WebKitGTK's webdriver package or pass a driver path)",
                 )?,
             };

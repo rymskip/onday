@@ -5,8 +5,6 @@ use std::sync::OnceLock;
 
 /// JS body that scrolls `el` into view through its nearest user-scrollable
 /// ancestor, then nudges it clear of sticky overlays. Expects `el` in scope.
-pub const SCROLL_TO_TARGET_VIA_SCROLLBAR: &str = include_str!("js/scroll_to_target.js");
-
 const LIB_TEMPLATE: &str = include_str!("js/lib.js");
 
 struct Runtime {
@@ -21,11 +19,8 @@ fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         let mut hasher = DefaultHasher::new();
         LIB_TEMPLATE.hash(&mut hasher);
-        SCROLL_TO_TARGET_VIA_SCROLLBAR.hash(&mut hasher);
         let version = format!("{:x}", hasher.finish());
-        let lib = LIB_TEMPLATE
-            .replace("/*__PRESCROLL__*/", SCROLL_TO_TARGET_VIA_SCROLLBAR)
-            .replace("__ONDAY_VERSION__", &version);
+        let lib = LIB_TEMPLATE.replace("__ONDAY_VERSION__", &version);
         let guard =
             format!("if (!window.__onday || window.__onday.version !== '{version}') {{\n{lib}\n}}");
         Runtime { version, guard }
@@ -135,10 +130,10 @@ pub fn writes_counter_script(predicate: &str) -> String {
 
 /// Escape a string for a single-quoted JS literal.
 pub fn js_single_quoted(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
+    let mut out = String::with_capacity(value.len().saturating_add(2));
     out.push('\'');
-    for c in value.chars() {
-        match c {
+    for character in value.chars() {
+        match character {
             '\\' => out.push_str("\\\\"),
             '\'' => out.push_str("\\'"),
             '\n' => out.push_str("\\n"),
@@ -170,9 +165,7 @@ mod tests {
     #[test]
     fn runtime_substitutes_every_placeholder() {
         let guard = &runtime().guard;
-        assert!(!guard.contains("__PRESCROLL__"));
         assert!(!guard.contains("__ONDAY_VERSION__"));
-        assert!(guard.contains("findScrollable"));
     }
 
     #[test]

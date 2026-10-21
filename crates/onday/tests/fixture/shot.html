@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Shot</title>
+  <style>
+    body { margin: 0; background: rgb(255, 255, 255); }
+    /* A document taller than the viewport, behind a fixed dialog that scrolls
+       on its own, the way an app's modal form does. */
+    #behind { height: 3000px; background: rgb(255, 0, 0); }
+    #dialog { position: fixed; inset: 40px; overflow: auto; background: rgb(0, 0, 0); }
+    #spacer { height: 1500px; }
+    #shot-target { width: 120px; height: 60px; background: rgb(0, 128, 255); }
+  </style>
+</head>
+<body>
+  <div id="behind"></div>
+  <div id="dialog">
+    <div id="spacer"></div>
+    <div id="shot-target"></div>
+    <div id="spacer-after" style="height: 1500px"></div>
+  </div>
+  <script>window.__appReady = true;</script>
+</body>
+</html>

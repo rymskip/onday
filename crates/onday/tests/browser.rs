@@ -20,6 +20,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const INDEX: &str = include_str!("fixture/index.html");
 const SECOND: &str = include_str!("fixture/second.html");
 const FRAME: &str = include_str!("fixture/frame.html");
+const SHOT: &str = include_str!("fixture/shot.html");
+const TALL: &str = include_str!("fixture/tall.html");
+const FAR: &str = include_str!("fixture/far.html");
+const COVER: &str = include_str!("fixture/cover.html");
+const DIALOG: &str = include_str!("fixture/dialog.html");
+const RESTART: &str = include_str!("fixture/restart.html");
+const REVEAL: &str = include_str!("fixture/reveal.html");
+const RESTART_FRAME: &str = include_str!("fixture/restart-frame.html");
 
 /// The fixture served from `127.0.0.1`, embedding a frame served from `localhost`: a
 /// different site, so the browser treats that frame as cross-origin.
@@ -55,7 +63,7 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
                 match stream.read(&mut buffer).await {
                     Ok(0) | Err(_) => return,
-                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    Ok(read) => request.extend(buffer.iter().take(read)),
                 }
             }
             let head = String::from_utf8_lossy(&request);
@@ -74,10 +82,24 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
                 }
                 return;
             }
-            let (status, kind, body) = match path.as_str() {
+            // The restarting frame carries how many restarts are left in its query.
+            let page = path.split('?').next().unwrap_or("/");
+            let (status, kind, body) = match page {
                 "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
+                "/restart" => ("200 OK", "text/html; charset=utf-8", RESTART.to_string()),
+                "/reveal" => ("200 OK", "text/html; charset=utf-8", REVEAL.to_string()),
+                "/restart-frame" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    RESTART_FRAME.to_string(),
+                ),
                 "/second" => ("200 OK", "text/html; charset=utf-8", SECOND.to_string()),
                 "/frame" => ("200 OK", "text/html; charset=utf-8", FRAME.to_string()),
+                "/shot" => ("200 OK", "text/html; charset=utf-8", SHOT.to_string()),
+                "/tall" => ("200 OK", "text/html; charset=utf-8", TALL.to_string()),
+                "/far" => ("200 OK", "text/html; charset=utf-8", FAR.to_string()),
+                "/cover" => ("200 OK", "text/html; charset=utf-8", COVER.to_string()),
+                "/dialog" => ("200 OK", "text/html; charset=utf-8", DIALOG.to_string()),
                 "/script-redirect" => (
                     "200 OK",
                     "text/html; charset=utf-8",
@@ -135,16 +157,15 @@ fn ref_of(snapshot: &str, needle: &str) -> Result<String> {
         .lines()
         .find(|line| line.contains(needle))
         .with_context(|| format!("no snapshot line contains {needle}:\n{snapshot}"))?;
-    let start = line.find("[ref=").context("line has no ref")? + 5;
-    let end = line[start..].find(']').context("unterminated ref")? + start;
-    Ok(line[start..end].to_string())
+    let (_, after) = line.split_once("[ref=").context("line has no ref")?;
+    let (reference, _) = after.split_once(']').context("unterminated ref")?;
+    Ok(reference.to_string())
 }
 
 /// The ref of the first line containing `needle` below the line containing `anchor`.
 fn ref_after(snapshot: &str, anchor: &str, needle: &str) -> Result<String> {
-    let below = snapshot
-        .find(anchor)
-        .map(|at| &snapshot[at..])
+    let (_, below) = snapshot
+        .split_once(anchor)
         .with_context(|| format!("no snapshot line contains {anchor}:\n{snapshot}"))?;
     ref_of(below, needle)
 }
@@ -240,6 +261,23 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     let nothing: Option<String> = driver.evaluate("null").await?;
     ensure!(nothing.is_none(), "null should decode as None");
 
+    // Over BiDi the runtime lives in its own sandbox, out of reach of whatever the
+    // page does to its globals. Classic has no sandbox, so this holds for BiDi only.
+    if bidi {
+        page.evaluate::<Option<String>>(
+            "(() => { setTimeout(() => { JSON.stringify = () => { throw new Error('page broke JSON'); }; \
+             Array.isArray = () => false; document.title = 'sabotaged'; }, 0); return null; })()",
+        )
+        .await?;
+        expect_page(&page).to_have_title("sabotaged").await?;
+        page.get_by_test_id("increment").click().await?;
+        expect(&page.get_by_test_id("count"))
+            .to_have_text("1")
+            .await?;
+        page.goto(base, WaitUntil::Load).await?;
+        expect_page(&page).to_have_title("Onday fixture").await?;
+    }
+
     // Clicks, auto-waiting and strictness.
     page.get_by_test_id("increment").click().await?;
     page.get_by_role("button", Some("Increment"))
@@ -295,7 +333,96 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     page.locator("#email").press("ControlOrMeta+A").await?;
     page.keyboard().press("Backspace").await?;
     expect(&page.locator("#email")).to_have_value("").await?;
-    typing(&page).await?;
+    // A wait takes its budget from the locator, or from the page when the
+    // locator names none.
+    page.locator("#email")
+        .wait_for(onday::ElementState::Visible)
+        .await?;
+    let started = std::time::Instant::now();
+    let absent = page
+        .locator("#never-rendered")
+        .with_timeout(Duration::from_millis(300))
+        .first()
+        .wait_for(onday::ElementState::Attached)
+        .await
+        .err()
+        .context("waiting for an element that never renders should fail")?;
+    ensure!(
+        started.elapsed() < Duration::from_secs(3),
+        "a 300 ms wait took {:?}: {absent:#}",
+        started.elapsed()
+    );
+    // A stroke presses once, moves while held and releases once.
+    let pad = page.locator("#pad").bounding_box().await?;
+    let (across, down) = (pad.left.saturating_add(20), pad.top.saturating_add(20));
+    page.mouse()
+        .stroke(&[
+            (across, down),
+            (across.saturating_add(60), down.saturating_add(20)),
+            (across.saturating_add(120), down.saturating_add(10)),
+        ])
+        .await?;
+    let stroke: Vec<String> = page.evaluate("window.__stroke ?? []").await?;
+    ensure!(
+        stroke.first().map(String::as_str) == Some("down")
+            && stroke.last().map(String::as_str) == Some("up")
+            && stroke.iter().filter(|event| *event == "move").count() >= 2,
+        "the pad saw {stroke:?} for a three-point stroke"
+    );
+    // A page reaches its sibling tabs through its own context.
+    let sibling = page.context().new_page().await?;
+    let open = page.context().pages().await?;
+    ensure!(
+        open.len() == 2 && open.contains(&page) && open.contains(&sibling),
+        "a tab opened from the page's context is not listed beside it"
+    );
+    // The raw driver follows whichever tab asks for it.
+    let on_sibling = sibling.driver_on_tab().await?.current_url().await?;
+    ensure!(
+        on_sibling.as_str() == "about:blank",
+        "the driver asked for the new tab is on {on_sibling}"
+    );
+    let on_page = page.driver_on_tab().await?.current_url().await?;
+    ensure!(
+        on_page.as_str() == page.url().await?,
+        "the driver asked for the first tab is on {on_page}"
+    );
+    sibling.close().await?;
+    // Every match gets a locator of its own.
+    let duplicates = page.get_by_test_id("dup").all().await?;
+    ensure!(
+        duplicates.len() == 2,
+        "two buttons share the testid, {} locators came back",
+        duplicates.len()
+    );
+    for duplicate in &duplicates {
+        expect(duplicate).to_have_text("Duplicate").await?;
+    }
+    // The wheel moves the scroller under the pointer and leaves the page be.
+    page.locator("#scroller").scroll_into_view().await?;
+    let scroller = page.locator("#scroller").bounding_box().await?;
+    let page_scroll: i64 = page.evaluate("Math.round(window.scrollY)").await?;
+    page.mouse()
+        .wheel_at(
+            scroller.left.saturating_add(scroller.width / 2),
+            scroller.top.saturating_add(scroller.height / 2),
+            0,
+            120,
+        )
+        .await?;
+    page.wait_for_function(
+        "document.getElementById('scroller').scrollTop > 0",
+        Duration::from_secs(5),
+    )
+    .await
+    .context("the wheel over the scroller did not scroll it")?;
+    let page_scroll_after: i64 = page.evaluate("Math.round(window.scrollY)").await?;
+    ensure!(
+        page_scroll_after == page_scroll,
+        "the wheel over the scroller moved the page from {page_scroll} to {page_scroll_after}"
+    );
+    typing(&page, Typist::Driver).await?;
+    typing(&page, Typist::Locator).await?;
 
     // Snapshot refs.
     let snapshot = page.snapshot().await?;
@@ -415,8 +542,13 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     }
     page.locator("#fetch-btn").click().await?;
     status_is(&page, "data:real").await?;
-    page.evaluate::<bool>("(() => { console.warn('late warning'); return true; })()")
-        .await?;
+    // Through a wrapper, as a dev server's console forwarding does: the first
+    // frame is the wrapper and the caller is further down the stack.
+    page.evaluate::<bool>(
+        "(() => { const forward = (...args) => console.warn(...args); \
+         function report() { forward('late warning'); } report(); return true; })()",
+    )
+    .await?;
     let settled = onday::poll_until(
         || async {
             page.network_requests(0).await.is_ok_and(|entries| {
@@ -456,6 +588,21 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
                 .any(|message| message.text.contains("fixture loaded")),
             "console: {console:?}"
         );
+        let late = console
+            .iter()
+            .find(|message| message.text.contains("late warning"))
+            .context("the late warning is in the console")?;
+        // Firefox sends only the top-most frame for a console warning
+        // (Bugzilla 1944136); Chromium sends the whole stack.
+        let frames = if browser.engine() == Engine::Firefox {
+            1
+        } else {
+            3
+        };
+        ensure!(
+            late.stack.len() >= frames && late.location.as_ref() == late.stack.first(),
+            "the warning keeps every frame the browser sends, the wrapper first: {late:?}"
+        );
     }
 
     // Screenshots.
@@ -465,13 +612,32 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     ensure!(full.starts_with(b"\x89PNG"), "not a PNG");
     let element = page.locator("h1").screenshot().await?;
     ensure!(element.starts_with(b"\x89PNG"), "element shot is not a PNG");
+    element_shot_is_the_element(&page, base).await?;
+    drop_onto_a_target_taller_than_its_box(&page, base).await?;
+    drag_onto_a_target_the_page_scrolls_to(&page, base).await?;
+    click_retried_when_its_press_lands_on_a_cover(&page, base).await?;
+    click_into_a_frame_that_restarts_its_document(&page, base).await?;
+    click_an_item_of_a_menu_scrolling_closes(&page, base).await?;
+    type_into_an_input_low_in_a_fixed_dialog(&page, base).await?;
+    if bidi {
+        inspect_runs_under_pristine_globals(&page, base).await?;
+    }
 
-    // Navigation with the ready hook, history.
+    // Navigation with the ready hook, history. The page asks before it is left,
+    // which the driver answers itself, so no dialog may stay on record after.
+    page.evaluate::<bool>(
+        "(() => { addEventListener('beforeunload', (event) => { event.preventDefault(); event.returnValue = ''; }); return true; })()",
+    )
+    .await?;
     page.goto(&format!("{base}/second"), WaitUntil::Ready)
         .await?;
     expect(&page.locator("h1"))
         .to_have_text("Second page")
         .await?;
+    ensure!(
+        page.dialog().await?.is_none(),
+        "the left page's beforeunload prompt is still on record"
+    );
     page.go_back().await?;
     expect_page(&page).to_have_url(&format!("{base}/")).await?;
 
@@ -569,46 +735,60 @@ async fn redirects(page: &Page, base: &str) -> Result<()> {
 }
 
 /// `WebDriverExt::type_into_selector` acts like a person and checks what the field holds.
-async fn typing(page: &Page) -> Result<()> {
-    let driver = page.driver();
-    let timeout = Duration::from_secs(10);
+/// The two ways to type into a field.
+#[derive(Debug, Clone, Copy)]
+enum Typist {
+    /// The raw session's `type_into_selector`.
+    Driver,
+    /// A locator's `type_into`.
+    Locator,
+}
+
+impl Typist {
+    async fn type_into(self, page: &Page, selector: &str, text: &str) -> Result<()> {
+        match self {
+            Typist::Driver => {
+                page.driver()
+                    .type_into_selector(selector, text, Duration::from_secs(10))
+                    .await
+            }
+            Typist::Locator => page.locator(selector).type_into(text).await,
+        }
+    }
+}
+
+async fn typing(page: &Page, typist: Typist) -> Result<()> {
     // A label covering the input forwards the pointer click's focus to it.
-    driver.type_into_selector("#float", "new", timeout).await?;
+    typist.type_into(page, "#float", "new").await?;
     expect(&page.locator("#float")).to_have_value("new").await?;
-    driver
-        .type_into_selector("#wrapped", "Grace", timeout)
-        .await?;
+    typist.type_into(page, "#wrapped", "Grace").await?;
     expect(&page.locator("#wrapped"))
         .to_have_value("Grace")
         .await?;
     // A mask reformats both the prefill and the typed digits.
-    driver
-        .type_into_selector("#phone", "5551234567", timeout)
-        .await?;
+    typist.type_into(page, "#phone", "5551234567").await?;
     expect(&page.locator("#phone"))
         .to_have_value("(555) 123-4567")
         .await?;
     // One input event for the clear, one per typed key.
-    driver.type_into_selector("#search", "ab", timeout).await?;
+    let inputs_before: u32 = page.evaluate("window.__searchInputs || 0").await?;
+    typist.type_into(page, "#search", "ab").await?;
     expect(&page.locator("#search")).to_have_value("ab").await?;
     let inputs: u32 = page.evaluate("window.__searchInputs").await?;
-    ensure!(inputs == 3, "#search saw {inputs} input events, expected 3");
-    driver.type_into_selector("#qty", "40", timeout).await?;
+    let typed = inputs.saturating_sub(inputs_before);
+    ensure!(typed == 3, "#search saw {typed} input events, expected 3");
+    typist.type_into(page, "#qty", "40").await?;
     expect(&page.locator("#qty")).to_have_value("40").await?;
-    driver
-        .type_into_selector("#notes", "only line", timeout)
-        .await?;
+    typist.type_into(page, "#notes", "only line").await?;
     expect(&page.locator("#notes"))
         .to_have_value("only line")
         .await?;
-    driver
-        .type_into_selector("#editor", "typed", timeout)
-        .await?;
+    typist.type_into(page, "#editor", "typed").await?;
     expect(&page.locator("#editor"))
         .to_have_text("typed")
         .await?;
-    let covered = driver
-        .type_into_selector("#covered", "x", timeout)
+    let covered = typist
+        .type_into(page, "#covered", "x")
         .await
         .err()
         .context("typing into a field under a toast should fail")?;
@@ -616,8 +796,17 @@ async fn typing(page: &Page) -> Result<()> {
         format!("{covered:#}").contains(r#"id="toast""#),
         "the focus error should name the toast: {covered:#}"
     );
-    let dated = driver
-        .type_into_selector("#when", "10012026", timeout)
+    // A box that clips its overflow, which no scrollbar reaches, hides part of
+    // the field and leaves what lies beneath the box under its centre. The
+    // locator's hit check refuses that point and scrolls the field clear.
+    if let Typist::Locator = typist {
+        typist.type_into(page, "#clipped", "seen").await?;
+        expect(&page.locator("#clipped"))
+            .to_have_value("seen")
+            .await?;
+    }
+    let dated = typist
+        .type_into(page, "#when", "10012026")
         .await
         .err()
         .context("typing into a date input should fail")?;
@@ -660,7 +849,7 @@ async fn http_get(address: &str, path: &str) -> Result<String> {
             .read(&mut buffer)
             .await
             .with_context(|| format!("read GET {path}"))?;
-        response.extend_from_slice(&buffer[..read]);
+        response.extend(buffer.iter().take(read));
         let text = String::from_utf8_lossy(&response);
         if let Some((head, body)) = text.split_once("\r\n\r\n") {
             let length = head.lines().find_map(|line| {
@@ -818,4 +1007,177 @@ async fn firefox_over_bidi() -> Result<()> {
 #[ignore = "needs Firefox; run with --ignored"]
 async fn firefox_over_classic() -> Result<()> {
     scenario(Engine::Firefox, ProtocolPreference::Classic).await
+}
+
+/// A drop zone taller than the box that scrolls it settles once scrolled into
+/// view: aligning one edge must not push the other out and scroll it back, or
+/// the target never holds still and the drag times out.
+async fn drop_onto_a_target_taller_than_its_box(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/tall"), WaitUntil::Ready).await?;
+    page.locator("#tall-source")
+        .drag_to(
+            &page
+                .locator("#tall-drop")
+                .with_timeout(Duration::from_secs(10)),
+        )
+        .await
+        .context("drag onto a drop zone taller than its scroll box")?;
+    expect(&page.locator("#tall-status"))
+        .to_have_text("dropped")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// A drop zone far down the page, reached by scrolling it: the press lands on the
+/// source, not on whatever the scroll brings under the point the source held.
+async fn drag_onto_a_target_the_page_scrolls_to(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/far"), WaitUntil::Ready).await?;
+    page.locator("#far-source")
+        .drag_to(&page.locator("#far-drop"))
+        .await
+        .context("drag onto a drop zone the page scrolls to")?;
+    expect(&page.locator("#far-status"))
+        .to_have_text("dropped")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// A click whose press is taken by something the page put over the target is
+/// blocked and retried once the target is clear, as Playwright's hit-target
+/// guard does: the target is clicked once and the cover never.
+async fn click_retried_when_its_press_lands_on_a_cover(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/cover"), WaitUntil::Ready)
+        .await?;
+    page.locator("#cover-target")
+        .click()
+        .await
+        .context("click a target the page covers on the first press")?;
+    expect(&page.locator("#cover-status"))
+        .to_have_text("clicked 1")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// An item of a menu that closes when the page scrolls takes a click while it
+/// is in view: a target already visible is not scrolled first, as Playwright
+/// does on Chromium, which would close the menu out from under the click.
+async fn click_an_item_of_a_menu_scrolling_closes(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/reveal"), WaitUntil::Ready)
+        .await?;
+    page.locator("#reveal-action")
+        .click()
+        .await
+        .context("click an item of a menu any scroll closes")?;
+    expect(&page.locator("#reveal-status"))
+        .to_have_text("clicked 1")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// A click into a frame that replaces its document while the click resolves
+/// into it, as a payment field's frame does while it starts, waits the
+/// restarts out rather than failing on the document that went away.
+async fn click_into_a_frame_that_restarts_its_document(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/restart"), WaitUntil::Ready)
+        .await?;
+    let input = page.locator("iframe#restart >> #restart-input");
+    input
+        .click()
+        .await
+        .context("click into a frame that keeps restarting its document")?;
+    expect(&page.locator("iframe#restart >> #restart-status"))
+        .to_have_text("settled")
+        .await?;
+    input
+        .type_into("4242")
+        .await
+        .context("type into the settled frame")?;
+    expect(&input).to_have_value("4242").await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// An input far down a fixed dialog's own scroll, under its floating label,
+/// takes typing: the dialog is the box it scrolls in, not a bar covering it, so
+/// scrolling it into view must not push it back out.
+async fn type_into_an_input_low_in_a_fixed_dialog(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/dialog"), WaitUntil::Ready)
+        .await?;
+    page.locator("#dialog-input")
+        .with_timeout(Duration::from_secs(10))
+        .type_into("123-45-6789")
+        .await
+        .context("type into an input low in a fixed dialog")?;
+    expect(&page.locator("#dialog-input"))
+        .to_have_value("123-45-6789")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// An element far down a fixed dialog's own scroll, with the document behind it
+/// scrolled too, is captured from where it is drawn: its middle is its own color,
+/// not the dialog's or the page's.
+async fn element_shot_is_the_element(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/shot"), WaitUntil::Ready).await?;
+    page.evaluate::<bool>("(() => { scrollTo(0, 500); return true; })()")
+        .await?;
+    let shot = page.locator("#shot-target").screenshot().await?;
+    let mut reader = png::Decoder::new(std::io::Cursor::new(shot))
+        .read_info()
+        .context("read the element shot")?;
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .context("size the element shot")?
+    ];
+    let info = reader
+        .next_frame(&mut pixels)
+        .context("decode the element shot")?;
+    let row = usize::try_from(info.height / 2).context("the middle row")?;
+    let column = usize::try_from(info.width / 2).context("the middle column")?;
+    let start = row
+        .checked_mul(info.line_size)
+        .and_then(|offset| offset.checked_add(column.checked_mul(info.color_type.samples())?))
+        .context("locate the middle pixel")?;
+    let middle = pixels
+        .get(start..start.saturating_add(3))
+        .context("the middle pixel lies outside the shot")?;
+    ensure!(
+        middle == [0, 128, 255],
+        "the element shot's middle is {middle:?}, not the element's rgb(0, 128, 255)"
+    );
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// A page that patches a builtin, as Svelte's dev build does to `indexOf`,
+/// leaves `inspect` with the original while it still reads the same document.
+async fn inspect_runs_under_pristine_globals(page: &Page, base: &str) -> Result<()> {
+    page.goto(base, WaitUntil::Load).await?;
+    page.evaluate::<bool>(
+        "(() => { Array.prototype.indexOf = () => { throw new Error('page patched indexOf'); }; \
+         window.__pageOnly = 1; return true; })()",
+    )
+    .await?;
+    let patched: bool = page
+        .evaluate("(() => { try { [1].indexOf(1); return false; } catch { return true; } })()")
+        .await?;
+    ensure!(patched, "the page's own world should see its patch");
+    let index: i64 = page.inspect("[1, 2].indexOf(2)").await?;
+    ensure!(index == 1, "inspect saw the page's indexOf: {index}");
+    let title: String = page.inspect("document.title").await?;
+    ensure!(
+        title == "Onday fixture",
+        "inspect read the title as {title:?}"
+    );
+    let leaked: bool = page.inspect("'__pageOnly' in window").await?;
+    ensure!(!leaked, "inspect sees a global the page defined");
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
 }

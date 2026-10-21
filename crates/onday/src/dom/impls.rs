@@ -1,17 +1,17 @@
 //! [`WebDriverExt`] for a live thirtyfour session.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, Instant};
-use thirtyfour::prelude::*;
+use thirtyfour::prelude::{By, Key, WebDriver, WebElement};
 use tracing::debug;
 
 use super::runtime::call_lib;
 use super::wait::wait_until_interactable;
-use super::{WebDriverExt, escape_js_single, testid_selector, typed_in_order};
+use super::{WebDriverExt, escape_js_single, testid_selector};
 use crate::js;
 use crate::poll::{Backoff, poll_until, poll_until_ok};
+use crate::typing::{TypingState, typed_in_order};
 
 async fn script_bool(driver: &WebDriver, script: &str) -> bool {
     match driver.execute(script, Vec::new()).await {
@@ -26,44 +26,23 @@ async fn script_bool(driver: &WebDriver, script: &str) -> bool {
     }
 }
 
-const PRESCROLL: &str = "(lib, selector) => {
+const SCROLL_INTO_VIEW: &str = "(lib, selector) => {
     const el = document.querySelector(selector);
-    if (el) lib.prescroll(el);
+    if (el) lib.scrollIntoViewIfNeeded(el);
     return true;
 }";
 
-/// Scroll the target into view clear of sticky overlays. Best effort: the settle
-/// and the click that follow report a target that is still out of reach.
-async fn prescroll(driver: &WebDriver, selector: &str) {
+/// Scroll the target to the centre, as Playwright does before a pointer action.
+/// Best effort: the settle and the click that follow report a target that is
+/// still out of reach.
+async fn scroll_into_view(driver: &WebDriver, selector: &str) {
     let scrolled = match serde_json::to_value(selector) {
-        Ok(selector) => call_lib::<bool>(driver, PRESCROLL, vec![selector]).await,
+        Ok(selector) => call_lib::<bool>(driver, SCROLL_INTO_VIEW, vec![selector]).await,
         Err(error) => Err(error).context("serialize selector"),
     };
     if let Err(error) = scrolled {
-        debug!("prescroll failed for {selector}: {error:#}");
+        debug!("scrolling {selector} into view failed: {error:#}");
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TypingKind {
-    Input,
-    Textarea,
-    Editable,
-    Native,
-    Other,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TypingState {
-    kind: TypingKind,
-    #[serde(rename = "type")]
-    input_type: Option<String>,
-    text: String,
-    focused: bool,
-    on_top: String,
-    active: String,
 }
 
 const TYPING_STATE: &str = "(lib, selector) => {
@@ -147,7 +126,7 @@ impl WebDriverExt for WebDriver {
                 "element exists in DOM but WebDriver cannot acquire handle for: {selector}"
             );
             match last {
-                Some(e) => e.context(message),
+                Some(error) => error.context(message),
                 None => anyhow::anyhow!(message),
             }
         })
@@ -165,7 +144,7 @@ impl WebDriverExt for WebDriver {
         loop {
             self.wait_for_selector(selector, timeout).await?;
             // Scroll first, then settle: the scroll itself moves the target.
-            prescroll(self, selector).await;
+            scroll_into_view(self, selector).await;
             wait_until_interactable(self, selector, timeout).await?;
             let element = self.find(By::Css(selector)).await.with_context(|| {
                 format!("failed to re-find selector after settling: {}", selector)
@@ -312,20 +291,11 @@ el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}))
         let start = Instant::now();
         let remaining = || timeout.saturating_sub(start.elapsed());
         self.wait_for_selector(selector, timeout).await?;
-        prescroll(self, selector).await;
+        scroll_into_view(self, selector).await;
         // Settle before acquiring the handle, or a re-render leaves it stale.
         wait_until_interactable(self, selector, remaining()).await?;
         let before = typing_state(self, selector).await?;
-        match before.kind {
-            TypingKind::Native => bail!(
-                "{selector} is an <input type={}>: text typing does not apply to that input type",
-                before.input_type.as_deref().unwrap_or_default()
-            ),
-            TypingKind::Other => {
-                bail!("{selector} is not an input, textarea or contenteditable element")
-            }
-            TypingKind::Input | TypingKind::Textarea | TypingKind::Editable => {}
-        }
+        before.ensure_typable(selector)?;
         let element = self
             .find(By::Css(selector))
             .await
