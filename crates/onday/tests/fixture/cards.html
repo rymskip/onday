@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cards</title>
+</head>
+<body>
+  <div id="fields"></div>
+  <script>
+    // Mounts its fields as a payment form does: each frame starts blank in this
+    // document's process, then loads from another site, which moves it out.
+    const origin = '__CARD_ORIGIN__';
+    for (let index = 0; index < 8; index += 1) {
+      const field = 'card-' + index;
+      const frame = document.createElement('iframe');
+      frame.id = field;
+      frame.title = field;
+      frame.width = 320;
+      frame.height = 60;
+      document.getElementById('fields').append(frame);
+      frame.src = origin + '/card-frame?field=' + field;
+    }
+    window.__appReady = true;
+  </script>
+</body>
+</html>

@@ -115,6 +115,52 @@ impl BidiCommand for AddPreloadScript {
     type Returns = AddPreloadScriptResult;
 }
 
+// ── goog:cdp ────────────────────────────────────────────────────────────────
+
+/// chromedriver's `goog:cdp.getSession`: the DevTools session that holds a context.
+#[derive(Debug, Serialize)]
+pub struct GetCdpSession {
+    pub context: BrowsingContextId,
+}
+
+impl BidiCommand for GetCdpSession {
+    const METHOD: &'static str = "goog:cdp.getSession";
+    type Returns = CdpSession;
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CdpSession {
+    /// Absent when the context has no session of its own yet.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// A DevTools command without parameters, sent to one session through
+/// chromedriver's `goog:cdp.sendCommand`.
+#[derive(Debug, Serialize)]
+pub struct SendCdpCommand {
+    pub method: CdpMethod,
+    pub params: Empty,
+    pub session: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum CdpMethod {
+    #[serde(rename = "Runtime.disable")]
+    RuntimeDisable,
+    #[serde(rename = "Runtime.enable")]
+    RuntimeEnable,
+}
+
+impl BidiCommand for SendCdpCommand {
+    const METHOD: &'static str = "goog:cdp.sendCommand";
+    type Returns = CdpReply;
+}
+
+/// A `goog:cdp.sendCommand` reply, whose DevTools result onday does not read.
+#[derive(Debug, Deserialize)]
+pub struct CdpReply {}
+
 // ── input ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

@@ -90,6 +90,13 @@ The browser window is visible by default; `--headless` (or `ONDAY_HEADLESS`) hid
 session another live process holds is reported by the first browser tool. Until the
 directory exists, the server logs to stderr.
 
+`--profile-from <session>` (or `ONDAY_PROFILE_FROM`) starts a new session's browser
+from a copy of an earlier session's profile for the engine it launches: installed
+extensions with their own storage, cookies, saved logins and site storage carry over,
+and the earlier session keeps its original. The earlier session must not be open in
+another process while it is copied, and the new session must not have a profile of
+its own yet.
+
 The tools follow playwright-mcp's names, plus:
 
 - `browser_launch` switches engine at runtime.

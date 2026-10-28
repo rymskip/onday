@@ -18,24 +18,45 @@ use time::macros::format_description;
 use tokio::sync::OnceCell;
 use tracing_subscriber::fmt::MakeWriter;
 
+use crate::profile::ProfileSource;
+
 pub struct Session {
     pub id: String,
     pub root: PathBuf,
+    profile_from: Option<ProfileSource>,
     log: McpLog,
     dir: OnceCell<Arc<SessionDir>>,
 }
 
 impl Session {
-    /// Settle the id and location without touching the filesystem.
-    pub fn new(output_dir: &Path, id: Option<String>, log: McpLog) -> Result<Session> {
+    /// Settle the id, the location and any session the profile starts from,
+    /// without touching the filesystem.
+    pub fn new(
+        output_dir: &Path,
+        id: Option<String>,
+        profile_from: Option<String>,
+        log: McpLog,
+    ) -> Result<Session> {
         let id = match id {
             Some(id) => validate_id(id)?,
             None => generated_id()?,
         };
         let root = absolute(&output_dir.join(&id))?;
+        let profile_from = match profile_from {
+            None => None,
+            Some(source) => {
+                let source = validate_id(source)?;
+                if source == id {
+                    bail!("session {id} cannot start from its own profile");
+                }
+                let source_root = absolute(&output_dir.join(&source))?;
+                Some(ProfileSource::new(source, source_root))
+            }
+        };
         Ok(Session {
             id,
             root,
+            profile_from,
             log,
             dir: OnceCell::new(),
         })
@@ -45,10 +66,16 @@ impl Session {
     pub async fn dir(&self) -> Result<Arc<SessionDir>> {
         self.dir
             .get_or_try_init(|| async {
-                SessionDir::open(&self.id, &self.root, &self.log).map(Arc::new)
+                SessionDir::open(&self.id, &self.root, &self.log, self.profile_from.is_some())
+                    .map(Arc::new)
             })
             .await
             .cloned()
+    }
+
+    /// The earlier session whose profile a new browser profile starts from.
+    pub fn profile_from(&self) -> Option<&ProfileSource> {
+        self.profile_from.as_ref()
     }
 
     /// The session directory if a tool has created it.
@@ -116,7 +143,13 @@ struct Metadata<'a> {
 
 impl SessionDir {
     /// Create (or reclaim) the session directory, take its lock and start `logs/mcp.log`.
-    fn open(id: &str, root: &Path, log: &McpLog) -> Result<SessionDir> {
+    /// A session that starts from another's profile must not have one of its own.
+    fn open(id: &str, root: &Path, log: &McpLog, starting_from: bool) -> Result<SessionDir> {
+        if starting_from && has_profile(root)? {
+            bail!(
+                "session {id} already has a browser profile; starting from another session's profile needs a new session"
+            );
+        }
         for dir in ["logs", "screenshots", "downloads", "snapshots"] {
             std::fs::create_dir_all(root.join(dir))
                 .with_context(|| format!("create {}", root.join(dir).display()))?;
@@ -164,7 +197,7 @@ impl SessionDir {
     }
 
     pub fn profile(&self, engine: Engine) -> PathBuf {
-        self.root.join(format!("profile-{engine}"))
+        profile_path(&self.root, engine)
     }
 
     pub fn driver_log(&self) -> PathBuf {
@@ -257,6 +290,27 @@ fn append(path: &Path) -> Result<File> {
         .with_context(|| format!("open {}", path.display()))
 }
 
+/// Where the session at `root` keeps its `engine` browser profile.
+pub fn profile_path(root: &Path, engine: Engine) -> PathBuf {
+    root.join(format!("profile-{engine}"))
+}
+
+/// Whether the session at `root` holds a browser profile for any engine.
+fn has_profile(root: &Path) -> Result<bool> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read an entry of {}", root.display()))?;
+        if entry.file_name().to_string_lossy().starts_with("profile-") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn absolute(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -317,7 +371,8 @@ mod tests {
     }
 
     fn shared(base: &Path) -> Session {
-        Session::new(base, Some("shared".to_string()), McpLog::default()).expect("new session")
+        Session::new(base, Some("shared".to_string()), None, McpLog::default())
+            .expect("new session")
     }
 
     #[tokio::test]
@@ -338,6 +393,42 @@ mod tests {
         drop(dir);
         assert!(session.opened().is_some());
         drop(session);
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    #[test]
+    fn a_session_cannot_start_from_its_own_profile() {
+        let base = std::env::temp_dir().join(format!("onday-self-test-{}", std::process::id()));
+        let refusal = Session::new(
+            &base,
+            Some("same".to_string()),
+            Some("same".to_string()),
+            McpLog::default(),
+        );
+        assert!(refusal.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_a_new_session_starts_from_another_profile() {
+        let base = std::env::temp_dir().join(format!("onday-seed-test-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("shared/profile-chromium")).expect("an existing profile");
+        let seeded = Session::new(
+            &base,
+            Some("shared".to_string()),
+            Some("earlier".to_string()),
+            McpLog::default(),
+        )
+        .expect("new session");
+        assert!(seeded.dir().await.is_err());
+        let fresh = Session::new(
+            &base,
+            Some("fresh".to_string()),
+            Some("earlier".to_string()),
+            McpLog::default(),
+        )
+        .expect("new session");
+        assert!(fresh.dir().await.is_ok());
+        drop(fresh);
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 

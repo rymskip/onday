@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,8 +14,8 @@ use thirtyfour::bidi::modules::browsing_context::{
     TraverseHistory, Viewport,
 };
 use thirtyfour::bidi::modules::network::{AddIntercept, InterceptPhase, RemoveIntercept};
-use thirtyfour::bidi::modules::script::Target;
-use thirtyfour::bidi::{BiDi, BidiError, BrowsingContextId};
+use thirtyfour::bidi::modules::script::{GetRealms, Target};
+use thirtyfour::bidi::{BiDi, BidiError, BrowsingContextId, Empty};
 use thirtyfour::{WebDriver, WebElement, WindowHandle};
 use tokio::sync::broadcast;
 
@@ -30,9 +30,9 @@ use crate::launch::Protocol;
 use crate::locator::Locator;
 use crate::poll::{Backoff, poll_until};
 use crate::proto::{
-    CallFunction, CallResult, CaptureScreenshot, KeyAction, LocalValue, PerformActions,
-    PointerAction, PointerParameters, RemoteValue, ScreenshotClip, SetFiles, SharedRef,
-    SourceActions, WheelAction,
+    CallFunction, CallResult, CaptureScreenshot, CdpMethod, GetCdpSession, KeyAction, LocalValue,
+    PerformActions, PointerAction, PointerParameters, RemoteValue, ScreenshotClip, SendCdpCommand,
+    SetFiles, SharedRef, SourceActions, WheelAction,
 };
 use crate::route::RouteHandler;
 
@@ -94,9 +94,7 @@ enum Handle {
 enum World {
     /// The page's own globals, for a caller's script.
     Page,
-    /// onday's sandbox, which the page's scripts cannot see or disturb. Some
-    /// drivers never answer a call into a third-party frame's own world (Stripe's
-    /// card fields under chromedriver), while its sandbox answers at once.
+    /// onday's sandbox, which the page's scripts cannot see or disturb.
     Runtime,
 }
 
@@ -110,16 +108,24 @@ fn runtime_sandbox(renewals: u32) -> String {
     }
 }
 
+/// How long a frame may take to report its document again after a Runtime restart.
+const FRAME_REPORT: Duration = Duration::from_secs(5);
+
+/// Whether a BiDi call failed with the driver's error `code`.
+fn driver_error(error: &anyhow::Error, code: &str) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BidiError>()
+            .is_some_and(|bidi| bidi.error == code)
+    })
+}
+
 /// Whether a call failed because the driver lost the sandbox it was sent to.
 /// chromedriver can come to answer every call into onday's sandbox in a frame
 /// with an internal assertion (seen on Stripe's card fields) while a sandbox
 /// under another name in the same frame works.
 fn lost_sandbox(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<BidiError>()
-            .is_some_and(|bidi| bidi.error == "unknown error")
-    })
+    driver_error(error, "unknown error")
 }
 
 /// Where a selector resolved in one frame continues.
@@ -295,6 +301,8 @@ pub(crate) struct PageInner {
     frames: FrameRegistry,
     /// Per frame, how many times its sandbox was replaced (see [`lost_sandbox`]).
     sandboxes: Mutex<HashMap<BrowsingContextId, u32>>,
+    /// Whether the driver answers `goog:cdp` commands, learned on first use.
+    devtools: OnceLock<bool>,
     timeout: Mutex<Duration>,
     closed: AtomicBool,
 }
@@ -360,6 +368,7 @@ impl Page {
                 events,
                 frames: FrameRegistry::default(),
                 sandboxes: Mutex::new(HashMap::new()),
+                devtools: OnceLock::new(),
                 timeout: Mutex::new(DEFAULT_TIMEOUT),
                 closed: AtomicBool::new(false),
             }),
@@ -964,7 +973,7 @@ impl Page {
         args: &[JsArg],
         user_activation: Option<bool>,
     ) -> Result<RemoteValue> {
-        let context = self.bidi_context(frame)?;
+        let context = self.frame_context(frame).await?;
         let call = || async {
             let arguments = args
                 .iter()
@@ -1003,6 +1012,91 @@ impl Page {
                 exception_details.line_number.unwrap_or(0),
                 exception_details.text
             ),
+        }
+    }
+
+    /// The BiDi context of `frame`, once the driver knows the frame's document.
+    ///
+    /// A frame that starts blank in its page's process and then loads from another
+    /// site moves to a process of its own. chromedriver's BiDi layer keeps its
+    /// listeners on the page's process for that frame, and the page dropping the
+    /// frame's blank document under a number the new process also gave the
+    /// frame's real one drops the driver's record of the real one. From then on
+    /// it never answers a script or input sent to the frame (Stripe's card fields
+    /// in a fresh browser). Restarting DevTools' Runtime domain in the frame's own
+    /// session makes the frame report its documents again, which restores it.
+    async fn frame_context(&self, frame: &Frame) -> Result<BrowsingContextId> {
+        let context = self.bidi_context(frame)?;
+        if !matches!(frame.target, FrameTarget::Bidi(_)) || self.knows_document(&context).await? {
+            return Ok(context);
+        }
+        let Some(session) = self.devtools_session(&context).await? else {
+            return Ok(context);
+        };
+        tracing::debug!("the driver lost the document of frame {context}; asking it again");
+        for method in [CdpMethod::RuntimeDisable, CdpMethod::RuntimeEnable] {
+            self.bidi_handle()?
+                .send(SendCdpCommand {
+                    method,
+                    params: Empty {},
+                    session: session.clone(),
+                })
+                .await
+                .with_context(|| format!("restart DevTools' Runtime domain in frame {context}"))?;
+        }
+        // A frame still loading reports its document when it arrives, which the
+        // call itself then waits for.
+        let started = Instant::now();
+        let mut gap = Backoff::FAST.start;
+        while started.elapsed() < FRAME_REPORT {
+            if self.knows_document(&context).await? {
+                return Ok(context);
+            }
+            tokio::time::sleep(gap).await;
+            gap = Backoff::FAST.next_gap(gap);
+        }
+        tracing::debug!("frame {context} has not reported its document yet");
+        Ok(context)
+    }
+
+    /// Whether the driver holds the page world of `context`'s document.
+    async fn knows_document(&self, context: &BrowsingContextId) -> Result<bool> {
+        let listed = self
+            .bidi_handle()?
+            .send(GetRealms {
+                context: Some(context.clone()),
+                r#type: Some("window".to_string()),
+            })
+            .await
+            .context("list the frame's realms")?;
+        Ok(listed
+            .realms
+            .iter()
+            .any(|realm| !realm.extra.contains_key("sandbox")))
+    }
+
+    /// The DevTools session holding `context`, or `None` when the driver answers
+    /// no `goog:cdp` commands, which only chromedriver does.
+    async fn devtools_session(&self, context: &BrowsingContextId) -> Result<Option<String>> {
+        if self.inner.devtools.get() == Some(&false) {
+            return Ok(None);
+        }
+        match self
+            .bidi_handle()?
+            .send(GetCdpSession {
+                context: context.clone(),
+            })
+            .await
+        {
+            Ok(found) => {
+                self.inner.devtools.get_or_init(|| true);
+                Ok(found.session)
+            }
+            Err(error) if driver_error(&error, "unknown command") => {
+                self.inner.devtools.get_or_init(|| false);
+                Ok(None)
+            }
+            Err(error) => Err(error.context("find the frame's DevTools session")),
         }
     }
 
@@ -1285,7 +1379,7 @@ impl Page {
                     },
                     actions,
                 };
-                self.perform(&self.bidi_context(frame)?, source, "pointer")
+                self.perform(&self.frame_context(frame).await?, source, "pointer")
                     .await
             }
             PageTarget::Classic(_) => {
@@ -1420,7 +1514,7 @@ impl Page {
                     id: "onday-keyboard".to_string(),
                     actions,
                 };
-                self.perform(&self.bidi_context(frame)?, source, "keys")
+                self.perform(&self.frame_context(frame).await?, source, "keys")
                     .await
             }
             PageTarget::Classic(_) => {
@@ -1485,7 +1579,7 @@ impl Page {
             Handle::Bidi(shared_id) => {
                 self.bidi_handle()?
                     .send(SetFiles {
-                        context: self.bidi_context(&element.frame)?,
+                        context: self.frame_context(&element.frame).await?,
                         element: SharedRef {
                             shared_id: shared_id.clone(),
                         },
