@@ -28,6 +28,8 @@ const DIALOG: &str = include_str!("fixture/dialog.html");
 const RESTART: &str = include_str!("fixture/restart.html");
 const REVEAL: &str = include_str!("fixture/reveal.html");
 const RESTART_FRAME: &str = include_str!("fixture/restart-frame.html");
+const CARDS: &str = include_str!("fixture/cards.html");
+const CARD_FRAME: &str = include_str!("fixture/card-frame.html");
 
 /// The fixture served from `127.0.0.1`, embedding a frame served from `localhost`: a
 /// different site, so the browser treats that frame as cross-origin.
@@ -88,6 +90,17 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
                 "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
                 "/restart" => ("200 OK", "text/html; charset=utf-8", RESTART.to_string()),
                 "/reveal" => ("200 OK", "text/html; charset=utf-8", REVEAL.to_string()),
+                // Its fields load from a site no other fixture uses, so their frames
+                // start a process of their own, as a payment form's do.
+                "/cards" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    CARDS.replace(
+                        "__CARD_ORIGIN__",
+                        &remote_origin.replace("://localhost", "://cards.localhost"),
+                    ),
+                ),
+                "/card-frame" => ("200 OK", "text/html; charset=utf-8", CARD_FRAME.to_string()),
                 "/restart-frame" => (
                     "200 OK",
                     "text/html; charset=utf-8",
@@ -983,6 +996,47 @@ async fn chromium_reports_closed_tabs() -> Result<()> {
 #[ignore = "needs Chrome; run with --ignored"]
 async fn chromium_reports_a_vanished_browser() -> Result<()> {
     vanishing(Vanish::Everything).await
+}
+
+/// Frames that start blank in the page's process and then load from another site
+/// move to a process of their own. In a fresh browser that process numbers its
+/// documents from where the page's process did, and chromedriver's BiDi layer then
+/// mistakes the page dropping the frames' blank documents for the frames losing
+/// their new ones, after which it never answers a call addressed to the frame.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome; run with --ignored"]
+async fn chromium_types_into_frames_that_moved_process() -> Result<()> {
+    install_tracing();
+    let base = serve().await?;
+    let browser =
+        Browser::launch(launch_options(Engine::Chromium, ProtocolPreference::Auto)).await?;
+    let typed = async {
+        let page = browser
+            .default_context(ContextOptions {
+                hooks: Some(Arc::new(FixtureHooks)),
+                ..ContextOptions::default()
+            })
+            .await?
+            .page()
+            .await?;
+        page.set_default_timeout(Duration::from_secs(10));
+        page.goto(&format!("{base}/cards"), WaitUntil::Ready)
+            .await?;
+        for index in 0..8 {
+            let field = format!("card-{index}");
+            let input = page.locator(format!("iframe#{field} >> #field"));
+            input
+                .type_into("4242")
+                .await
+                .with_context(|| format!("type into the {field} frame"))?;
+            expect(&input).to_have_value("4242").await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let closed = browser.close().await;
+    typed?;
+    closed
 }
 
 #[tokio::test(flavor = "multi_thread")]

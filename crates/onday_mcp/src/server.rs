@@ -197,6 +197,13 @@ impl OndayServer {
         };
         if !self.config.isolated {
             let profile = dir.profile(engine);
+            // A browser relaunched in this session keeps the profile its first launch made.
+            if let Some(source) = self.session.profile_from()
+                && !profile.exists()
+            {
+                source.copy_to(engine, &profile)?;
+                tracing::info!("started the {engine} profile from session {}", source.id());
+            }
             std::fs::create_dir_all(&profile)
                 .with_context(|| format!("create {}", profile.display()))?;
             options = options.user_data_dir(profile);
@@ -448,6 +455,9 @@ impl OndayServer {
         let outcome = async {
             let root = self.session.root.display();
             let mut out = format!("Session: {}\nDirectory: {root}\n", self.session.id);
+            if let Some(source) = self.session.profile_from() {
+                writeln!(out, "Profile started from session: {}", source.id()).context("format")?;
+            }
             match self.session.opened() {
                 Some(dir) => writeln!(
                     out,

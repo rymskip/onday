@@ -1,5 +1,6 @@
 mod config;
 mod params;
+mod profile;
 mod server;
 mod session;
 
@@ -16,7 +17,12 @@ use crate::session::{McpLog, Session};
 async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     let log = McpLog::default();
-    let session = Session::new(&config.output_dir, config.session.clone(), log.clone())?;
+    let session = Session::new(
+        &config.output_dir,
+        config.session.clone(),
+        config.profile_from.clone(),
+        log.clone(),
+    )?;
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

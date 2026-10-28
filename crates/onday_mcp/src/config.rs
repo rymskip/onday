@@ -36,6 +36,12 @@ pub struct Config {
     #[arg(long, env = "ONDAY_ISOLATED", value_parser = FalseyValueParser::new())]
     pub isolated: bool,
 
+    /// Start this new session's browser from a copy of the named earlier session's
+    /// profile: its installed extensions and their data, cookies, saved logins and
+    /// site storage. The earlier session must not be open in another onday_mcp.
+    #[arg(long, env = "ONDAY_PROFILE_FROM", conflicts_with = "isolated")]
+    pub profile_from: Option<String>,
+
     /// Speak WebDriver Classic only, never BiDi.
     #[arg(long, env = "ONDAY_CLASSIC", value_parser = FalseyValueParser::new())]
     pub classic: bool,
