@@ -16,7 +16,7 @@ use onday::{
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use serde_json::value::RawValue;
@@ -34,7 +34,7 @@ use crate::session::{Session, SessionDir};
 
 const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, WebDriver Classic fallback).
 - This server process is one session with its own browser, profile and logs under the session directory (see browser_status), created by the first browser tool. Other sessions in the same directory are independent.
-- browser_launch switches engine (chromium, firefox, webkit) at any time; other tools launch the default engine on first use.
+- browser_launch switches engine (chromium, firefox, webkit) at any time, and with profile_from starts the browser from a copy of another session's profile; other tools launch the default engine on first use.
 - Target elements with a ref from browser_snapshot (e.g. \"e12\") or a selector: CSS, text=…, role=button[name=\"Save\"], testid=…, label=…, chained with >>.
 - Iframes, same- or cross-origin, appear in the snapshot under their iframe entry, with refs like \"f1e3\". A selector enters a frame when a >> step follows one: iframe[title=\"Editor\"] >> testid=save. Without that step a selector only searches the top document.
 - Actions auto-wait for the element to be visible, stable, enabled and unobscured, then use real pointer and key input.
@@ -197,13 +197,6 @@ impl OndayServer {
         };
         if !self.config.isolated {
             let profile = dir.profile(engine);
-            // A browser relaunched in this session keeps the profile its first launch made.
-            if let Some(source) = self.session.profile_from()
-                && !profile.exists()
-            {
-                source.copy_to(engine, &profile)?;
-                tracing::info!("started the {engine} profile from session {}", source.id());
-            }
             std::fs::create_dir_all(&profile)
                 .with_context(|| format!("create {}", profile.display()))?;
             options = options.user_data_dir(profile);
@@ -400,13 +393,20 @@ impl OndayServer {
 impl OndayServer {
     #[tool(
         name = "browser_launch",
-        description = "Start the browser, or restart it with another engine (chromium, firefox, webkit) without restarting the server. Closes the running browser and its tabs."
+        description = "Start the browser, or restart it with another engine (chromium, firefox, webkit) or from another session's profile, without restarting the server. Closes the running browser and its tabs."
     )]
     async fn browser_launch(
         &self,
         Parameters(params): Parameters<LaunchParams>,
     ) -> Result<CallToolResult, McpError> {
         let outcome = async {
+            let profile_source = match params.profile_from {
+                Some(_) if self.config.isolated => {
+                    bail!("an isolated session has no profile to replace")
+                }
+                Some(id) => Some(self.session.profile_source(id)?),
+                None => None,
+            };
             let mut state = self.state.lock().await;
             if let Some(running) = state.running.take() {
                 running
@@ -436,8 +436,19 @@ impl OndayServer {
                 },
                 classic: params.classic.unwrap_or(current.classic),
             };
+            if let Some(source) = &profile_source {
+                let dir = self.session.dir().await?;
+                source.replace(engine, &dir.profile(engine))?;
+                tracing::info!(
+                    "replaced the {engine} profile with session {}'s",
+                    source.id()
+                );
+            }
             let running = self.launch(&settings).await?;
-            let summary = format!("Launched {settings} over {}", running.browser.protocol());
+            let mut summary = format!("Launched {settings} over {}", running.browser.protocol());
+            if let Some(source) = &profile_source {
+                write!(summary, " from session {}'s profile", source.id()).context("format")?;
+            }
             state.settings = settings;
             state.vanished = None;
             state.running = Some(running);
@@ -455,9 +466,6 @@ impl OndayServer {
         let outcome = async {
             let root = self.session.root.display();
             let mut out = format!("Session: {}\nDirectory: {root}\n", self.session.id);
-            if let Some(source) = self.session.profile_from() {
-                writeln!(out, "Profile started from session: {}", source.id()).context("format")?;
-            }
             match self.session.opened() {
                 Some(dir) => writeln!(
                     out,
@@ -1173,8 +1181,8 @@ impl OndayServer {
 
 #[tool_handler]
 impl ServerHandler for OndayServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("onday", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS.to_string())
     }

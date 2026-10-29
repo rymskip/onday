@@ -53,6 +53,11 @@ pub struct LaunchParams {
     )]
     #[serde(default)]
     pub classic: Option<bool>,
+    #[schemars(
+        description = "Session id (in the same output directory) whose profile for the engine replaces this session's: its extensions and their data, cookies, saved logins and site storage. That session must not be open in another onday_mcp"
+    )]
+    #[serde(default)]
+    pub profile_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
