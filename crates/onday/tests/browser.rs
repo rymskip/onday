@@ -1067,6 +1067,62 @@ async fn chromium_over_classic() -> Result<()> {
     scenario(Engine::Chromium, ProtocolPreference::Classic).await
 }
 
+/// A headed browser whose window is minimized stops rendering frames, so any wait
+/// paced by animation frames never ends. Clicks must still go through.
+async fn click_in_a_hidden_window(engine: Engine, preference: ProtocolPreference) -> Result<()> {
+    install_tracing();
+    let base = serve().await?;
+    let browser = Browser::launch(launch_options(engine, preference).headed()).await?;
+    let clicked = async {
+        let page = browser
+            .default_context(ContextOptions {
+                hooks: Some(Arc::new(FixtureHooks)),
+                ..ContextOptions::default()
+            })
+            .await?
+            .page()
+            .await?;
+        page.set_default_timeout(Duration::from_secs(10));
+        page.goto(&base, WaitUntil::Load).await?;
+        page.driver_on_tab()
+            .await?
+            .minimize_window()
+            .await
+            .context("minimize the window")?;
+        let visibility: String = page.evaluate("document.visibilityState").await?;
+        ensure!(
+            visibility == "hidden",
+            "the minimized page reports {visibility:?}, so the test hides nothing"
+        );
+        page.get_by_test_id("increment").click().await?;
+        expect(&page.get_by_test_id("count"))
+            .to_have_text("1")
+            .await
+    }
+    .await;
+    let closed = browser.close().await;
+    clicked?;
+    closed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome and a display; run with --ignored"]
+async fn chromium_clicks_in_a_hidden_window_over_bidi() -> Result<()> {
+    click_in_a_hidden_window(Engine::Chromium, ProtocolPreference::Auto).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome and a display; run with --ignored"]
+async fn chromium_clicks_in_a_hidden_window_over_classic() -> Result<()> {
+    click_in_a_hidden_window(Engine::Chromium, ProtocolPreference::Classic).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Firefox and a display; run with --ignored"]
+async fn firefox_clicks_in_a_hidden_window_over_bidi() -> Result<()> {
+    click_in_a_hidden_window(Engine::Firefox, ProtocolPreference::Auto).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Firefox; run with --ignored"]
 async fn firefox_over_bidi() -> Result<()> {

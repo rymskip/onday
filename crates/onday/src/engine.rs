@@ -85,6 +85,16 @@ fn chromium_capabilities(options: &LaunchOptions) -> Result<Capabilities> {
     // Small /dev/shm on containers and servers crashes the renderer; spill to /tmp.
     caps.add_arg("--disable-dev-shm-usage")
         .context("dev-shm arg")?;
+    // As Playwright launches it: a window behind others keeps rendering at full
+    // speed instead of being treated as hidden, so pages and waits behave as seen.
+    for arg in [
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+    ] {
+        caps.add_arg(arg)
+            .with_context(|| format!("chrome arg {arg}"))?;
+    }
     if let Some((width, height)) = options.window_size {
         caps.add_arg(&format!("--window-size={width},{height}"))
             .context("window-size arg")?;
