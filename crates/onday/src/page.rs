@@ -1383,30 +1383,72 @@ impl Page {
                     .await
             }
             PageTarget::Classic(_) => {
-                self.in_classic_frame(frame, || self.classic_pointer(anchor, actions))
+                let origin = match anchor {
+                    Some(anchor) => Some(self.classic_origin(frame, anchor).await?),
+                    None => None,
+                };
+                self.in_classic_frame(frame, || self.classic_pointer(origin, actions))
                     .await
             }
         }
     }
 
+    /// The element a Classic move is offset from, and its in-view centre: the
+    /// nearest of the anchor and its ancestors that shows whole and holds the
+    /// anchor's point. A driver may scroll an origin it finds partly hidden into
+    /// view before it moves, as chromedriver does, even through a box that clips
+    /// without scrolling, which no person can scroll.
+    async fn classic_origin(
+        &self,
+        frame: &Frame,
+        anchor: Anchor<'_>,
+    ) -> Result<(WebElement, i64, i64)> {
+        let args = [
+            JsArg::El(anchor.element.clone()),
+            JsArg::Int(anchor.horizontal),
+            JsArg::Int(anchor.vertical),
+        ]
+        .iter()
+        .map(JsArg::to_classic)
+        .collect::<Result<Vec<_>>>()?;
+        let func = "(lib, el, x, y) => lib.classicOrigin(el, x, y)";
+        let body = js::classic_body(&js::array_call(func, &self.classic_prelude(frame)));
+        let returned = self
+            .with_runtime(frame, || async {
+                let returned = self
+                    .in_classic_frame(frame, || async {
+                        self.driver()
+                            .execute(body.clone(), args.clone())
+                            .await
+                            .context("execute script")?
+                            .convert::<serde_json::Value>()
+                            .context("read the pointer origin")
+                    })
+                    .await?;
+                match returned {
+                    serde_json::Value::Array(items) => Ok(Some(items)),
+                    serde_json::Value::String(text) if text == js::RUNTIME_MISSING => Ok(None),
+                    other => bail!("expected a pointer origin, got {other}"),
+                }
+            })
+            .await?;
+        let [element, horizontal, vertical] = <[serde_json::Value; 3]>::try_from(returned)
+            .map_err(|items| anyhow!("expected an element and a point, got {items:?}"))?;
+        let element = WebElement::from_json(element, Arc::clone(self.driver()))
+            .context("read the pointer origin's element")?;
+        let coordinate = |value: serde_json::Value| {
+            value
+                .as_i64()
+                .ok_or_else(|| anyhow!("expected a whole coordinate, got {value}"))
+        };
+        Ok((element, coordinate(horizontal)?, coordinate(vertical)?))
+    }
+
     async fn classic_pointer(
         &self,
-        anchor: Option<Anchor<'_>>,
+        anchor: Option<(WebElement, i64, i64)>,
         actions: Vec<PointerAction>,
     ) -> Result<()> {
-        let anchor = match anchor {
-            Some(Anchor {
-                element:
-                    ElementRef {
-                        handle: Handle::Classic(element),
-                        ..
-                    },
-                horizontal,
-                vertical,
-            }) => Some((element, horizontal, vertical)),
-            Some(_) => bail!("a BiDi element cannot anchor Classic input"),
-            None => None,
-        };
         let mut chain = self.driver().action_chain();
         for action in actions {
             chain = match action {
@@ -1414,12 +1456,12 @@ impl Page {
                     horizontal,
                     vertical,
                     ..
-                } => match anchor {
+                } => match &anchor {
                     Some((element, anchor_horizontal, anchor_vertical)) => chain
                         .move_to_element_with_offset(
                             element,
-                            horizontal.saturating_sub(anchor_horizontal),
-                            vertical.saturating_sub(anchor_vertical),
+                            horizontal.saturating_sub(*anchor_horizontal),
+                            vertical.saturating_sub(*anchor_vertical),
                         ),
                     None => chain.move_to(horizontal, vertical),
                 },
@@ -1555,18 +1597,32 @@ impl Page {
                 self.perform(context, source, "wheel").await
             }
             // Classic has no wheel this session can send, so the scroller the
-            // wheel would have reached is moved instead.
+            // wheel would have reached is moved instead, on the axes a person's
+            // wheel could move: never one that clips without scrolling, nor a
+            // page an open modal has locked.
             PageTarget::Classic(_) => self
                 .evaluate::<bool>(&format!(
                     "(() => {{ \
-                     const scrolls = (el) => {{ \
+                     const dx = {delta_x}, dy = {delta_y}; \
+                     const locked = (overflow) => overflow === 'hidden' || overflow === 'clip'; \
+                     const scrolls = (el, axis) => {{ \
                        const style = getComputedStyle(el); \
-                       return /(auto|scroll)/.test(style.overflowY + style.overflowX) \
-                         && (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth); \
+                       const overflow = axis === 'x' ? style.overflowX : style.overflowY; \
+                       const room = axis === 'x' ? el.scrollWidth > el.clientWidth \
+                         : el.scrollHeight > el.clientHeight; \
+                       return (overflow === 'auto' || overflow === 'scroll') && room; \
                      }}; \
+                     const takes = (el) => (dx !== 0 && scrolls(el, 'x')) || (dy !== 0 && scrolls(el, 'y')); \
                      let el = document.elementFromPoint({horizontal}, {vertical}); \
-                     while (el && el !== document.documentElement && !scrolls(el)) el = el.parentElement; \
-                     (el && el !== document.documentElement ? el : window).scrollBy({delta_x}, {delta_y}); \
+                     while (el && el !== document.documentElement && !takes(el)) el = el.parentElement; \
+                     if (el && el !== document.documentElement) {{ \
+                       el.scrollBy(scrolls(el, 'x') ? dx : 0, scrolls(el, 'y') ? dy : 0); \
+                       return true; \
+                     }} \
+                     const root = getComputedStyle(document.documentElement); \
+                     const body = document.body ? getComputedStyle(document.body) : root; \
+                     const page = root.overflowX === 'visible' && root.overflowY === 'visible' ? body : root; \
+                     window.scrollBy(locked(page.overflowX) ? 0 : dx, locked(page.overflowY) ? 0 : dy); \
                      return true; }})()"
                 ))
                 .await
