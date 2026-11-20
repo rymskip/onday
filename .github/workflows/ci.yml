@@ -62,7 +62,21 @@ jobs:
           fi
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
-      # Publishes onday before onday_mcp, which depends on it.
-      - run: cargo publish --workspace --locked
+      # Each crate is published only when crates.io lacks this version, so a
+      # rerun after a partial publish finishes it. onday_mcp depends on onday,
+      # and cargo waits for onday to reach the index before going on.
+      - name: Publish what crates.io does not have yet
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for crate in onday onday_mcp; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A 'onday-release (https://github.com/rymskip/onday)' \
+              "https://crates.io/api/v1/crates/$crate/$version")"
+            case "$status" in
+              200) echo "$crate $version is already on crates.io" ;;
+              404) cargo publish -p "$crate" --locked ;;
+              *) echo "crates.io answered $status for $crate $version" >&2; exit 1 ;;
+            esac
+          done
