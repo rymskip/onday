@@ -643,14 +643,84 @@
         return false;
     }
 
-    // The element's centre in this document's viewport, and whether a pointer there hits it.
+    // The part of `rect`, one of `el`'s boxes, a person sees: inside the viewport
+    // and inside every box around `el` that clips its overflow, on each axis it
+    // clips. An absolutely placed element escapes the boxes below its containing
+    // block, and a fixed one every box. `viewport` is the part inside the
+    // viewport alone, which tells a target off screen from one a box hides.
+    function visiblePart(el, rect) {
+        const viewport = {
+            left: Math.max(rect.left, 0),
+            top: Math.max(rect.top, 0),
+            right: Math.min(rect.right, window.innerWidth),
+            bottom: Math.min(rect.bottom, window.innerHeight),
+        };
+        const part = { ...viewport, clippedBy: null };
+        let position = getComputedStyle(el).position;
+        for (let box = el.parentElement; box && box !== document.body && box !== document.documentElement; box = box.parentElement) {
+            if (position === 'fixed') break;
+            const style = getComputedStyle(box);
+            const escapes = position === 'absolute' && style.position === 'static';
+            if (!escapes) {
+                const clipsX = style.overflowX !== 'visible', clipsY = style.overflowY !== 'visible';
+                if (clipsX || clipsY) {
+                    const outer = box.getBoundingClientRect();
+                    const left = outer.left + box.clientLeft, top = outer.top + box.clientTop;
+                    if (clipsX) {
+                        part.left = Math.max(part.left, left);
+                        part.right = Math.min(part.right, left + box.clientWidth);
+                    }
+                    if (clipsY) {
+                        part.top = Math.max(part.top, top);
+                        part.bottom = Math.min(part.bottom, top + box.clientHeight);
+                    }
+                    if (!part.clippedBy && (part.right <= part.left || part.bottom <= part.top)) part.clippedBy = box;
+                }
+                position = style.position === 'static' ? position : style.position;
+            }
+        }
+        return { part, viewport };
+    }
+
+    // The element a Classic pointer move at (x, y) is offset from, and the
+    // point the move starts at: its in-view centre as WebDriver defines it, the
+    // middle of its first client rect cut to the viewport alone. It is the
+    // nearest of `el` and its ancestors that shows whole and holds the point,
+    // which no driver scrolls before it moves; `el` itself when none does.
+    function classicOrigin(el, x, y) {
+        let origin = el;
+        for (let box = el; box && box !== document.documentElement; box = box.parentElement) {
+            const outer = box.getBoundingClientRect();
+            const holds = x >= outer.left && x < outer.right && y >= outer.top && y < outer.bottom;
+            if (holds && fullyInView(box)) {
+                origin = box;
+                break;
+            }
+        }
+        const rect = origin.getClientRects()[0] || origin.getBoundingClientRect();
+        const left = Math.max(rect.left, 0), right = Math.min(rect.right, window.innerWidth);
+        const top = Math.max(rect.top, 0), bottom = Math.min(rect.bottom, window.innerHeight);
+        return [origin, Math.floor((left + right) / 2), Math.floor((top + bottom) / 2)];
+    }
+
+    // Why nothing of an element shows, from `visiblePart`'s answer for its box.
+    function hiddenReason(seen) {
+        if (seen.viewport.right <= seen.viewport.left || seen.viewport.bottom <= seen.viewport.top) {
+            return { reason: 'outside the viewport', outside: true };
+        }
+        return { reason: 'hidden by ' + describe(seen.part.clippedBy || document.documentElement) + ', which clips it', outside: false };
+    }
+
+    // The middle of the part of the element a person sees, and whether a pointer
+    // there hits it.
     function hitPoint(el) {
         if (!el || !el.isConnected) return { ok: false, reason: 'detached from the document', x: 0, y: 0, outside: false };
         const r = el.getBoundingClientRect();
-        const left = Math.max(r.left, 0), top = Math.max(r.top, 0);
-        const right = Math.min(r.right, window.innerWidth), bottom = Math.min(r.bottom, window.innerHeight);
+        const seen = visiblePart(el, r);
+        const { left, top, right, bottom } = seen.part;
         if (right <= left || bottom <= top) {
-            return { ok: false, reason: 'outside the viewport', x: Math.round(r.left), y: Math.round(r.top), outside: true };
+            const hidden = hiddenReason(seen);
+            return { ok: false, reason: hidden.reason, x: Math.round(r.left), y: Math.round(r.top), outside: hidden.outside };
         }
         const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
         const hit = deepHit(document, x, y);
@@ -685,14 +755,59 @@
         return { ok: true, reason: '', x: px, y: py, outside: false };
     }
 
+    // Whether `overflow` keeps a person from scrolling a box on that axis.
+    function locksScroll(overflow) {
+        return overflow === 'hidden' || overflow === 'clip';
+    }
+
+    // Run `scroll`, then put back every offset a person could not have changed:
+    // on each axis, every box around `el` that clips without scrolling, and the
+    // page itself when its overflow is locked, as an open modal locks it. A
+    // scroll such a box would need leaves the target out of reach, and the
+    // checks that follow report it rather than act on a screen no person sees.
+    function scrollAsAPerson(el, scroll) {
+        const root = document.documentElement;
+        const rootStyle = getComputedStyle(root);
+        const bodyStyle = document.body ? getComputedStyle(document.body) : rootStyle;
+        // The body's overflow is the page's when the root leaves its own visible.
+        const propagates = rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible';
+        const pageStyle = propagates ? bodyStyle : rootStyle;
+        const page = {
+            x: locksScroll(pageStyle.overflowX),
+            y: locksScroll(pageStyle.overflowY),
+            left: window.scrollX,
+            top: window.scrollY,
+        };
+        const held = [];
+        for (let box = el.parentElement; box && box !== root; box = box.parentElement) {
+            if (propagates && box === document.body) break;
+            const style = getComputedStyle(box);
+            const x = locksScroll(style.overflowX), y = locksScroll(style.overflowY);
+            if (x || y) held.push({ box, x, y, left: box.scrollLeft, top: box.scrollTop });
+        }
+        try {
+            scroll();
+        } finally {
+            for (const lock of held) {
+                if (lock.x) lock.box.scrollLeft = lock.left;
+                if (lock.y) lock.box.scrollTop = lock.top;
+            }
+            if (page.x || page.y) {
+                window.scrollTo(page.x ? page.left : window.scrollX, page.y ? page.top : window.scrollY);
+            }
+        }
+    }
+
     // Scroll this document until a point in the frame's viewport is on screen, then
     // report where it landed.
     function revealFrame(frame, x, y) {
-        frame.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
-        const [dx, dy] = frameOffset(frame);
-        const px = x + dx, py = y + dy;
-        if (py < 0 || py >= window.innerHeight) window.scrollBy(0, py - window.innerHeight / 2);
-        if (px < 0 || px >= window.innerWidth) window.scrollBy(px - window.innerWidth / 2, 0);
+        scrollAsAPerson(frame, () => {
+            frame.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+            const [dx, dy] = frameOffset(frame);
+            const px = x + dx, py = y + dy;
+            if (py < 0 || py >= window.innerHeight) window.scrollBy(0, py - window.innerHeight / 2);
+            if (px < 0 || px >= window.innerWidth) window.scrollBy(px - window.innerWidth / 2, 0);
+        });
         return frameHit(frame, x, y);
     }
 
@@ -721,22 +836,24 @@
     // native call, so the same check runs here: a scroll the target did not
     // need can close the menu it sits in.
     function scrollIntoViewIfNeeded(el) {
-        if (typeof el.scrollIntoViewIfNeeded === 'function') {
-            el.scrollIntoViewIfNeeded(true);
-            return;
-        }
-        if (fullyInView(el)) return;
-        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        scrollAsAPerson(el, () => {
+            if (typeof el.scrollIntoViewIfNeeded === 'function') {
+                el.scrollIntoViewIfNeeded(true);
+                return;
+            }
+            if (fullyInView(el)) return;
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        });
     }
 
-    // Scroll every box holding `el` so it sits at `block` (start, center or
-    // end), or with `null` only as far as it is out of view.
+    // Scroll every box a person could scroll so `el` sits at `block` (start,
+    // center or end), or with `null` only as far as it is out of view.
     function scrollAligned(el, block) {
         if (block === null) {
             scrollIntoViewIfNeeded(el);
             return;
         }
-        el.scrollIntoView({ block, inline: block, behavior: 'instant' });
+        scrollAsAPerson(el, () => el.scrollIntoView({ block, inline: block, behavior: 'instant' }));
     }
 
     // ── pointer actions, as Playwright's ──────────────────────────────────
@@ -880,20 +997,20 @@
     }
 
     // As `_clickablePoint` over BiDi: the middle of the first client rect that
-    // keeps an area once clipped to the viewport.
+    // keeps an area once clipped to what a person sees, the viewport and every
+    // box that clips it, as `visiblePart` measures.
     function clickablePoint(el) {
         if (!el || !el.isConnected) return { ok: false, reason: 'detached from the document', x: 0, y: 0, outside: false };
         const rects = [...el.getClientRects()];
         if (!rects.length) return { ok: false, reason: 'not visible', x: 0, y: 0, outside: false };
-        const width = window.innerWidth, height = window.innerHeight;
         for (const rect of rects) {
-            const left = Math.min(Math.max(rect.left, 0), width), right = Math.min(Math.max(rect.right, 0), width);
-            const top = Math.min(Math.max(rect.top, 0), height), bottom = Math.min(Math.max(rect.bottom, 0), height);
-            if ((right - left) * (bottom - top) > 0.99) {
+            const { left, top, right, bottom } = visiblePart(el, rect).part;
+            if (right > left && bottom > top && (right - left) * (bottom - top) > 0.99) {
                 return { ok: true, reason: '', x: Math.round((left + right) / 2), y: Math.round((top + bottom) / 2), outside: false };
             }
         }
-        return { ok: false, reason: 'outside of the viewport', x: Math.round(rects[0].left), y: Math.round(rects[0].top), outside: true };
+        const hidden = hiddenReason(visiblePart(el, rects[0]));
+        return { ok: false, reason: hidden.reason, x: Math.round(rects[0].left), y: Math.round(rects[0].top), outside: hidden.outside };
     }
 
     function expectHitTarget(hitPoint, targetElement) {
@@ -1272,6 +1389,7 @@
         scrollAligned,
         pointerStates,
         clickablePoint,
+        classicOrigin,
         guardHits,
         endHitGuard,
         dragSource,
