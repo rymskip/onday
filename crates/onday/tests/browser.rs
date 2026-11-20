@@ -27,6 +27,7 @@ const COVER: &str = include_str!("fixture/cover.html");
 const DIALOG: &str = include_str!("fixture/dialog.html");
 const RESTART: &str = include_str!("fixture/restart.html");
 const REVEAL: &str = include_str!("fixture/reveal.html");
+const LOCKED: &str = include_str!("fixture/locked.html");
 const RESTART_FRAME: &str = include_str!("fixture/restart-frame.html");
 const CARDS: &str = include_str!("fixture/cards.html");
 const CARD_FRAME: &str = include_str!("fixture/card-frame.html");
@@ -90,6 +91,7 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
                 "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
                 "/restart" => ("200 OK", "text/html; charset=utf-8", RESTART.to_string()),
                 "/reveal" => ("200 OK", "text/html; charset=utf-8", REVEAL.to_string()),
+                "/locked" => ("200 OK", "text/html; charset=utf-8", LOCKED.to_string()),
                 // Its fields load from a site no other fixture uses, so their frames
                 // start a process of their own, as a payment form's do.
                 "/cards" => (
@@ -631,6 +633,7 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     click_retried_when_its_press_lands_on_a_cover(&page, base).await?;
     click_into_a_frame_that_restarts_its_document(&page, base).await?;
     click_an_item_of_a_menu_scrolling_closes(&page, base).await?;
+    clicks_never_shift_what_a_person_cannot_scroll(&page, base).await?;
     type_into_an_input_low_in_a_fixed_dialog(&page, base).await?;
     if bidi {
         inspect_runs_under_pristine_globals(&page, base).await?;
@@ -809,10 +812,23 @@ async fn typing(page: &Page, typist: Typist) -> Result<()> {
         format!("{covered:#}").contains(r#"id="toast""#),
         "the focus error should name the toast: {covered:#}"
     );
-    // A box that clips its overflow, which no scrollbar reaches, hides part of
-    // the field and leaves what lies beneath the box under its centre. The
-    // locator's hit check refuses that point and scrolls the field clear.
+    // A box that clips its overflow, which no scrollbar reaches, shows only a
+    // strip of the field and leaves what lies beneath the box under its centre.
+    // The locator aims at the strip a person sees and never scrolls the box.
     if let Typist::Locator = typist {
+        // Typing then scrolls the box itself, as it does for a person: the
+        // browser keeps the caret in view. So the box is checked after the press.
+        page.locator("#clipped")
+            .click()
+            .await
+            .context("click the strip of #clipped a person sees")?;
+        let scrolled: i64 = page
+            .evaluate("Math.round(document.getElementById('clip-box').scrollTop)")
+            .await?;
+        ensure!(
+            scrolled == 0,
+            "pressing #clipped scrolled its clipping box {scrolled}px, which no person can scroll"
+        );
         typist.type_into(page, "#clipped", "seen").await?;
         expect(&page.locator("#clipped"))
             .to_have_value("seen")
@@ -1126,6 +1142,51 @@ async fn click_an_item_of_a_menu_scrolling_closes(page: &Page, base: &str) -> Re
         .await
         .context("click an item of a menu any scroll closes")?;
     expect(&page.locator("#reveal-status"))
+        .to_have_text("clicked 1")
+        .await?;
+    page.goto(base, WaitUntil::Load).await?;
+    Ok(())
+}
+
+/// A click scrolls only what a person could scroll. A drawer that clips
+/// sideways keeps its offset through every retry's forced alignment, and a
+/// target only a sideways shift of it would reveal is out of reach, so the
+/// click fails rather than land on a screen no person could see.
+async fn clicks_never_shift_what_a_person_cannot_scroll(page: &Page, base: &str) -> Result<()> {
+    page.goto(&format!("{base}/locked"), WaitUntil::Ready)
+        .await?;
+    let drawer_left = "window.__lockedMaxLeft";
+    page.locator("#locked-target")
+        .click()
+        .await
+        .context("click a target low in a drawer, through a cover its first press raises")?;
+    expect(&page.locator("#locked-status"))
+        .to_have_text("clicked 1")
+        .await?;
+    let shifted: i64 = page.evaluate(drawer_left).await?;
+    let scrolls: i64 = page.evaluate("window.__lockedScrolls").await?;
+    ensure!(
+        shifted == 0,
+        "a click shifted the drawer up to {shifted}px sideways over {scrolls} scrolls, \
+         which no person can scroll"
+    );
+    let unreachable = page
+        .locator("#clipped-target")
+        .click_with(ClickOptions {
+            timeout: Some(Duration::from_secs(2)),
+            ..ClickOptions::default()
+        })
+        .await;
+    ensure!(
+        unreachable.is_err(),
+        "a target past the drawer's clipped edge took a click no person could make"
+    );
+    let shifted: i64 = page.evaluate(drawer_left).await?;
+    ensure!(
+        shifted == 0,
+        "reaching for the clipped target shifted the drawer {shifted}px sideways"
+    );
+    expect(&page.locator("#locked-status"))
         .to_have_text("clicked 1")
         .await?;
     page.goto(base, WaitUntil::Load).await?;

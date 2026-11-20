@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Locked</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; overflow: hidden; }
+    /* A drawer: it scrolls down for a person, never sideways, though a blurred
+       decoration clipped at its edge makes it far wider inside than it shows. */
+    #locked-drawer {
+      position: fixed; top: 0; left: 0; bottom: 0; width: 400px;
+      overflow-x: hidden; overflow-y: auto; border-right: 1px solid #999;
+    }
+    #locked-glow { position: absolute; top: 0; left: 40px; width: 3000px; height: 200px; background: #fdd; }
+    .filler { height: 1200px; }
+    /* At the drawer's right edge, where centring it sideways would shift the
+       drawer, as a row's last action sits in a table. */
+    #locked-target { display: block; margin-left: 220px; width: 160px; height: 40px; }
+    /* Past the drawer's clipped edge: no person can reach it. */
+    #clipped-target { position: absolute; top: 1300px; left: 700px; width: 120px; height: 40px; }
+    .tail { height: 600px; }
+    #locked-cover { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, 0.2); }
+    #locked-status { position: fixed; top: 0; right: 0; }
+  </style>
+</head>
+<body>
+  <div id="locked-drawer">
+    <div id="locked-glow"></div>
+    <div class="filler"></div>
+    <button id="locked-target" type="button">Target</button>
+    <button id="clipped-target" type="button">Clipped</button>
+    <div class="tail"></div>
+  </div>
+  <div id="locked-status">waiting</div>
+  <script>
+    const status = document.getElementById('locked-status');
+    let clicks = 0;
+    document.getElementById('locked-target').addEventListener('click', () => {
+      clicks += 1;
+      status.textContent = 'clicked ' + clicks;
+    });
+    document.getElementById('clipped-target').addEventListener('click', () => {
+      status.textContent = 'clicked the clipped target';
+    });
+    // How far sideways the drawer was ever shifted, and how often it scrolled.
+    const drawer = document.getElementById('locked-drawer');
+    window.__lockedMaxLeft = 0;
+    window.__lockedScrolls = 0;
+    drawer.addEventListener('scroll', () => {
+      window.__lockedScrolls += 1;
+      window.__lockedMaxLeft = Math.max(window.__lockedMaxLeft, Math.round(drawer.scrollLeft));
+    });
+    // The first press covers the page for a while, as cover.html does, so the
+    // click retries through its forced alignments before it lands.
+    window.addEventListener('pointerdown', () => {
+      const cover = document.createElement('div');
+      cover.id = 'locked-cover';
+      document.body.appendChild(cover);
+      setTimeout(() => cover.remove(), 700);
+    }, { capture: true, once: true });
+    window.__appReady = true;
+  </script>
+</body>
+</html>

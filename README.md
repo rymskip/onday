@@ -40,7 +40,9 @@ browser.close().await?;
 Every action waits until its element is actionable before acting:
 
 1. The element is resolved fresh.
-2. It is scrolled into view through its nearest scrollable ancestor.
+2. It is scrolled into view, moving only what a person could scroll: a box that clips
+   with `overflow: hidden` or `clip`, and a page an open modal has locked, keep their
+   offsets, so a target only such a scroll would reveal is reported out of reach.
 3. The action waits for the element to be sized, visible, opaque and enabled, and to
    hold still across two probes.
 4. It checks that nothing else would receive the pointer at the click point.
