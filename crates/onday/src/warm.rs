@@ -3,9 +3,9 @@
 //! a caller-supplied JS predicate rather than the `load` event, so sessions can
 //! use the `none` page-load strategy.
 
+use crate::{Page, WaitUntil};
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
-use thirtyfour::WebDriver;
 
 /// Progress while warming one route, so callers own their log formatting.
 pub enum WarmEvent {
@@ -22,7 +22,7 @@ pub enum WarmEvent {
 /// Poll `ready_script` (a function body returning a boolean) until it returns
 /// `true` or `timeout` elapses.
 pub async fn wait_for_ready<F>(
-    driver: &WebDriver,
+    page: &Page,
     ready_script: &str,
     timeout: Duration,
     mut on_progress: F,
@@ -31,13 +31,11 @@ where
     F: FnMut(Duration),
 {
     let start = Instant::now();
+    let predicate = format!("() => {{ {ready_script} }}");
     let held = crate::poll::poll_until_reporting(
         || async {
-            match driver.execute(ready_script, Vec::new()).await {
-                Ok(returned) => returned.convert::<bool>().unwrap_or_else(|error| {
-                    tracing::debug!("ready predicate returned a non-boolean: {error:#}");
-                    false
-                }),
+            match page.evaluate::<bool>(&predicate).await {
+                Ok(ready) => ready,
                 Err(error) => {
                     tracing::debug!("ready predicate failed: {error:#}");
                     false
@@ -59,7 +57,7 @@ where
 /// reloading between them, up to `budget`. A dependency re-optimization can
 /// strand a page unhydrated; waiting never recovers that, a reload does.
 pub async fn warm_route<F>(
-    driver: &WebDriver,
+    page: &Page,
     url: &str,
     ready_script: &str,
     budget: Duration,
@@ -72,12 +70,11 @@ where
     let route_start = Instant::now();
     // Stamp the outgoing document so a poll cannot read its readiness after
     // `goto` returns early. Fails harmlessly when there is no document yet.
-    let stamped = driver
-        .execute("window.__warmPending = true; return true;", Vec::new())
+    let stamped = page
+        .evaluate::<bool>("() => { window.__warmPending = true; return true; }")
         .await
         .is_ok();
-    driver
-        .goto(url)
+    page.goto(url, WaitUntil::Commit)
         .await
         .with_context(|| format!("warm navigate failed for {url}"))?;
     on_event(WarmEvent::Navigated(route_start.elapsed()));
@@ -90,7 +87,7 @@ where
 
     while route_start.elapsed() < budget {
         let wait = budget.saturating_sub(route_start.elapsed()).min(slice);
-        let reached = wait_for_ready(driver, &guarded, wait, |elapsed| {
+        let reached = wait_for_ready(page, &guarded, wait, |elapsed| {
             on_event(WarmEvent::Waiting(elapsed));
         })
         .await
@@ -100,8 +97,7 @@ where
             return Ok(());
         }
         on_event(WarmEvent::Reloading(route_start.elapsed()));
-        driver
-            .refresh()
+        page.reload_until(WaitUntil::Commit)
             .await
             .with_context(|| format!("warm reload failed for {url}"))?;
     }

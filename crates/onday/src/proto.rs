@@ -5,8 +5,26 @@ use serde::{Deserialize, Serialize};
 use thirtyfour::bidi::modules::browsing_context::CaptureScreenshotResult;
 use thirtyfour::bidi::modules::script::{AddPreloadScriptResult, Target};
 use thirtyfour::bidi::{
-    BidiCommand, BidiEvent, BrowsingContextId, Empty, InterceptId, RequestId, UserContextId,
+    BidiCommand, BidiEvent, BrowsingContextId, Empty, InterceptId, NavigationId, RequestId,
+    UserContextId,
 };
+
+// ── browsingContext ─────────────────────────────────────────────────────────
+
+/// `browsingContext.navigationStarted`. Firefox leaves out the `url` the spec
+/// requires when a history traversal starts, so it is optional here; the commit
+/// that follows always names it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NavigationStartedEvent {
+    pub context: BrowsingContextId,
+    pub navigation: Option<NavigationId>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl BidiEvent for NavigationStartedEvent {
+    const METHOD: &'static str = "browsingContext.navigationStarted";
+}
 
 // ── script ──────────────────────────────────────────────────────────────────
 
@@ -332,6 +350,8 @@ pub struct WireRequest {
     pub method: String,
     #[serde(default)]
     pub headers: Vec<WireHeader>,
+    #[serde(default)]
+    pub initiator_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

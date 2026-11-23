@@ -1,7 +1,6 @@
 //! How a browser is started: engine, flags, and where its WebDriver server comes from.
 
 use std::path::PathBuf;
-use thirtyfour::PageLoadStrategy;
 
 use crate::engine::Engine;
 
@@ -52,6 +51,28 @@ impl PromptBehavior {
             PromptBehavior::Dismiss => "dismiss",
             PromptBehavior::AcceptAndNotify => "accept and notify",
             PromptBehavior::DismissAndNotify => "dismiss and notify",
+        }
+    }
+}
+
+/// When a navigation command returns (W3C `pageLoadStrategy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageLoadStrategy {
+    /// Once the `load` event fires.
+    #[default]
+    Normal,
+    /// Once `DOMContentLoaded` fires.
+    Eager,
+    /// As soon as the new document commits; readiness is the caller's to wait for.
+    None,
+}
+
+impl PageLoadStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageLoadStrategy::Normal => "normal",
+            PageLoadStrategy::Eager => "eager",
+            PageLoadStrategy::None => "none",
         }
     }
 }

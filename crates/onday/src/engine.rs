@@ -33,13 +33,13 @@ impl Engine {
     }
 
     /// Capabilities for a new session of this engine.
-    pub fn capabilities(self, options: &LaunchOptions) -> Result<Capabilities> {
+    pub(crate) fn capabilities(self, options: &LaunchOptions) -> Result<Capabilities> {
         let mut caps = match self {
             Engine::Chromium => chromium_capabilities(options)?,
             Engine::Firefox => firefox_capabilities(options)?,
             Engine::Webkit => webkit_capabilities(options)?,
         };
-        caps.set_page_load_strategy(options.page_load_strategy.clone())
+        caps.set("pageLoadStrategy", options.page_load_strategy.as_str())
             .context("set page load strategy")?;
         // The W3C key; thirtyfour's helper only writes the legacy one.
         caps.set("unhandledPromptBehavior", options.prompt_behavior.as_str())

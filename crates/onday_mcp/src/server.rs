@@ -231,7 +231,7 @@ impl OndayServer {
         let Some(id) = page.context_id() else {
             return;
         };
-        if !running.streamed.insert(id.as_str().to_string()) {
+        if !running.streamed.insert(id.to_string()) {
             return;
         }
         let mut console = page.on_console();

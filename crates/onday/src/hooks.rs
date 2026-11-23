@@ -43,8 +43,8 @@ impl AppHooks for DefaultHooks {}
 
 static GLOBAL: OnceLock<Arc<dyn AppHooks>> = OnceLock::new();
 
-/// Install the process-wide hooks used by raw-driver helpers
-/// ([`WebDriverExt`](crate::dom::WebDriverExt)). The first install wins.
+/// Install the process-wide hooks: a context without its own uses them, as does
+/// [`testid_selector`](crate::testid_selector). The first install wins.
 pub fn install_global(hooks: Arc<dyn AppHooks>) -> bool {
     GLOBAL.set(hooks).is_ok()
 }

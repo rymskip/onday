@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use thirtyfour::bidi::BiDi;
 use thirtyfour::bidi::modules::browser::CreateUserContext;
 use thirtyfour::manager::{BrowserKind, WebDriverManager};
 use thirtyfour::{Capabilities, WebDriver, WindowHandle};
@@ -240,14 +239,20 @@ impl Browser {
         &self.inner.options
     }
 
-    /// The browser's first session as a raw thirtyfour driver.
-    pub fn driver(&self) -> &WebDriver {
+    pub(crate) fn driver(&self) -> &WebDriver {
         &self.inner.primary.driver
     }
 
-    /// The BiDi connection of the first session, when negotiated.
-    pub fn bidi(&self) -> Option<&BiDi> {
-        self.inner.primary.bidi.as_ref().map(BidiChannel::raw)
+    /// Chromium's remote-debugging address (`host:port`), for a tool that attaches
+    /// over the DevTools protocol; `None` for other engines.
+    pub fn debugger_address(&self) -> Option<String> {
+        self.driver()
+            .handle()
+            .capabilities()
+            .get("goog:chromeOptions")
+            .and_then(|options| options.get("debuggerAddress"))
+            .and_then(|address| address.as_str())
+            .map(str::to_string)
     }
 
     /// Whether the browser still answers, probed over WebDriver Classic within
@@ -321,7 +326,7 @@ async fn endpoint_for(options: &LaunchOptions) -> Result<Endpoint> {
             ));
         }
     };
-    let mut builder = WebDriverManager::builder()
+    let mut builder = crate::install::manager_for(options.engine)
         .on_status(|status| tracing::debug!("driver manager: {status:?}"));
     if let DriverSource::Binary(path) = &options.driver {
         builder = builder.driver_binary(kind, path.clone());
