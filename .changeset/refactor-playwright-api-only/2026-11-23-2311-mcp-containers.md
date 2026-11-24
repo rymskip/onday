@@ -1,7 +1,7 @@
 # feat(mcp): open a tab in a named container
 
 - **Date:** 2026-11-23 23:11
-- **Commit:** this commit
+- **Commit:** ea73ed0
 - **Area:** MCP
 
 ## Problem

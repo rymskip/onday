@@ -1,7 +1,7 @@
 # refactor(api)!: expose no WebDriver client type
 
 - **Date:** 2026-11-23 12:09
-- **Commit:** 22d04cd
+- **Commit:** 523cd61
 - **Area:** API
 
 ## Problem

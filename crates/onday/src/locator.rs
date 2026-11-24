@@ -746,6 +746,12 @@ impl Locator {
                 )
                 .await;
             let missed = self.lift_guard(&aim, pointer).await;
+            if let Err(failure) = &clicked
+                && is_target_replaced(failure)
+            {
+                last.record(format!("{failure:#}"));
+                continue;
+            }
             clicked.with_context(|| format!("click {}", self.selector))?;
             match missed {
                 None => return Ok(()),
@@ -785,6 +791,12 @@ impl Locator {
                 )
                 .await;
             let missed = self.lift_guard(&aim, pointer).await;
+            if let Err(failure) = &moved
+                && is_target_replaced(failure)
+            {
+                last.record(format!("{failure:#}"));
+                continue;
+            }
             moved.with_context(|| format!("hover {}", self.selector))?;
             match missed {
                 None => return Ok(()),
@@ -1455,6 +1467,12 @@ impl std::error::Error for StrictModeViolation {}
 
 fn is_strictness(error: &anyhow::Error) -> bool {
     error.downcast_ref::<StrictModeViolation>().is_some()
+}
+
+fn is_target_replaced(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::page::TargetReplaced>()
+        .is_some()
 }
 
 fn is_browser_gone(error: &anyhow::Error) -> bool {

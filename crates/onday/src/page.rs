@@ -16,6 +16,7 @@ use thirtyfour::bidi::modules::browsing_context::{
 use thirtyfour::bidi::modules::network::{AddIntercept, InterceptPhase, RemoveIntercept};
 use thirtyfour::bidi::modules::script::{GetRealms, Target};
 use thirtyfour::bidi::{BidiError, BrowsingContextId, Empty};
+use thirtyfour::error::WebDriverErrorInner;
 use thirtyfour::{WebDriver, WebElement, WindowHandle};
 use tokio::sync::broadcast;
 
@@ -1438,6 +1439,18 @@ impl Page {
                         self.driver()
                             .execute(body.clone(), args.clone())
                             .await
+                            .map_err(|failure| {
+                                let replaced = matches!(
+                                    failure.as_inner(),
+                                    WebDriverErrorInner::StaleElementReference(_)
+                                );
+                                let failure = anyhow::Error::new(failure);
+                                if replaced {
+                                    failure.context(TargetReplaced)
+                                } else {
+                                    failure
+                                }
+                            })
                             .context("execute script")?
                             .convert::<serde_json::Value>()
                             .context("read the pointer origin")
@@ -2349,3 +2362,16 @@ fn load_phase(wait: WaitUntil, has_ready_script: bool) -> Option<LoadPhase> {
         WaitUntil::Load | WaitUntil::Ready => Some(LoadPhase::Loaded),
     }
 }
+
+/// The pointer's target was replaced before any input was sent, as an element
+/// is when its frame restarts its document, so the action can aim again.
+#[derive(Debug)]
+pub(crate) struct TargetReplaced;
+
+impl std::fmt::Display for TargetReplaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the target element was replaced before the pointer reached it")
+    }
+}
+
+impl std::error::Error for TargetReplaced {}
