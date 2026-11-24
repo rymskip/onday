@@ -306,6 +306,11 @@ pub struct TabsParams {
     #[schemars(description = "URL to open in a new tab")]
     #[serde(default)]
     pub url: Option<String>,
+    #[schemars(
+        description = "With new: the container to open the tab in, a context with its own cookies and storage, made the first time it is named (default: the browser's own context)"
+    )]
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

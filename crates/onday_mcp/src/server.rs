@@ -9,9 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use onday::{
-    Browser, BrowserContext, ClickOptions, ContextOptions, DialogPolicy, DriverSource,
-    ElementState, Engine, Fulfill, Health, InterceptedRequest, LaunchOptions, Locator, MouseButton,
-    Page, Protocol, ProtocolPreference, RouteAction, ScreenshotOptions, WaitUntil,
+    Browser, ClickOptions, ContextOptions, DialogPolicy, DriverSource, ElementState, Engine,
+    Fulfill, Health, InterceptedRequest, LaunchOptions, Locator, MouseButton, Page, Protocol,
+    ProtocolPreference, RouteAction, ScreenshotOptions, WaitUntil,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -31,6 +31,7 @@ use crate::params::{
     WaitParams,
 };
 use crate::session::{Session, SessionDir};
+use crate::tabs::{Tabs, line};
 
 const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, WebDriver Classic fallback).
 - This server process is one session with its own browser, profile and logs under the session directory (see browser_status), created by the first browser tool. Other sessions in the same directory are independent.
@@ -40,12 +41,12 @@ const INSTRUCTIONS: &str = "Browser automation through onday (WebDriver BiDi, We
 - Actions auto-wait for the element to be visible, stable, enabled and unobscured, then use real pointer and key input.
 - Mutating tools answer with the page URL, any open dialog (\"Modal state\"), new console messages and a fresh snapshot.
 - Console and network logs stream into the session's logs/ directory.
+- browser_tabs with action new and a container opens a tab in a named container: a context with its own cookies and storage, made the first time it is named. Tabs are listed with their container and selected by their listed number.
 - If the browser closes or crashes outside onday, the next tool fails fast and releases it. The session, its directory and profile stay; retrying the tool launches a new browser with the same settings. browser_status reports the browser's health.";
 
 struct Running {
     browser: Browser,
-    context: BrowserContext,
-    current: usize,
+    tabs: Tabs,
     console_seen: u64,
     network_seen: u64,
     streamed: HashSet<String>,
@@ -202,22 +203,20 @@ impl OndayServer {
             options = options.user_data_dir(profile);
         }
         let browser = Browser::launch(options).await?;
-        let context = browser
-            .default_context(ContextOptions {
-                viewport: Some(settings.viewport),
-                dialog_policy: DialogPolicy::Leave,
-                downloads_dir: Some(dir.downloads()),
-                ..ContextOptions::default()
-            })
-            .await?;
+        let context_options = ContextOptions {
+            viewport: Some(settings.viewport),
+            dialog_policy: DialogPolicy::Leave,
+            downloads_dir: Some(dir.downloads()),
+            ..ContextOptions::default()
+        };
+        let context = browser.default_context(context_options.clone()).await?;
         let page = context.page().await?;
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
         dir.write_metadata(Some(engine), Some(browser.protocol().to_string()))?;
         tracing::info!("launched {settings} over {}", browser.protocol());
         let mut running = Running {
             browser,
-            context,
-            current: 0,
+            tabs: Tabs::new(context, context_options),
             console_seen: 0,
             network_seen: 0,
             streamed: HashSet::new(),
@@ -260,21 +259,9 @@ impl OndayServer {
         }
         let running = state.running.as_mut().context("no browser")?;
         let dir = self.session.dir().await?;
-        let pages = running.context.pages().await?;
-        let Some(last) = pages.last() else {
-            let page = running.context.new_page().await?;
-            page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
-            running.current = 0;
-            Self::stream_logs(&dir, running, &page);
-            return Ok(page);
-        };
-        // The tab the session was on may have closed; the last one takes its place.
-        let page = match pages.get(running.current) {
-            Some(page) => page.clone(),
-            None => {
-                running.current = pages.len().saturating_sub(1);
-                last.clone()
-            }
+        let page = match running.tabs.current_page().await? {
+            Some(page) => page,
+            None => running.tabs.new_page(&running.browser, None).await?,
         };
         page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
         Self::stream_logs(&dir, running, &page);
@@ -505,12 +492,11 @@ impl OndayServer {
                     if health != Health::Alive {
                         return Ok(out);
                     }
-                    let pages = running.context.pages().await?;
-                    for (index, page) in pages.iter().enumerate() {
-                        let marker = if index == running.current { "*" } else { " " };
-                        let url = page.url().await.unwrap_or_else(|error| format!("({error:#})"));
-                        writeln!(out, "{marker} tab {index}: {url}").context("format")?;
-                        for pattern in page.routes() {
+                    for (position, tab) in running.tabs.list().await?.iter().enumerate() {
+                        let url = tab.page.url().await.unwrap_or_else(|error| format!("({error:#})"));
+                        let current = tab.at == running.tabs.current;
+                        writeln!(out, "{}", line(current, position, &tab.at, &url)).context("format")?;
+                        for pattern in tab.page.routes() {
                             writeln!(out, "    route {pattern}").context("format")?;
                         }
                     }
@@ -1082,7 +1068,7 @@ impl OndayServer {
 
     #[tool(
         name = "browser_tabs",
-        description = "List, open, select or close tabs."
+        description = "List, open, select or close tabs. A tab opened with a container gets that container's own cookies and storage, so two signed-in users can sit side by side in one browser."
     )]
     async fn browser_tabs(
         &self,
@@ -1095,22 +1081,24 @@ impl OndayServer {
             match params.action {
                 TabAction::List => {}
                 TabAction::New => {
-                    let page = running.context.new_page().await?;
+                    let page = running
+                        .tabs
+                        .new_page(&running.browser, params.container.as_deref())
+                        .await?;
+                    page.set_default_timeout(Duration::from_secs(self.config.action_timeout));
+                    // A background tab is not painted, so a screenshot of it shows a
+                    // frame from before its last change.
+                    page.bring_to_front().await?;
                     if let Some(url) = &params.url {
                         page.goto(url, WaitUntil::Load).await?;
                     }
-                    running.current = running.context.pages().await?.len().saturating_sub(1);
                     running.console_seen = 0;
                     running.network_seen = 0;
                 }
                 TabAction::Select => {
-                    let index = params.index.context("select needs an index")?;
-                    let pages = running.context.pages().await?;
-                    let page = pages
-                        .get(index)
-                        .with_context(|| format!("no tab {index}"))?;
+                    let position = params.index.context("select needs an index")?;
+                    let page = running.tabs.select(position).await?;
                     page.bring_to_front().await?;
-                    running.current = index;
                     running.console_seen = page
                         .console_messages(0)
                         .await?
@@ -1118,26 +1106,17 @@ impl OndayServer {
                         .map_or(0, |message| message.seq);
                     running.network_seen = 0;
                 }
-                TabAction::Close => {
-                    let pages = running.context.pages().await?;
-                    let index = params.index.unwrap_or(running.current);
-                    let page = pages
-                        .get(index)
-                        .with_context(|| format!("no tab {index}"))?;
-                    page.close().await?;
-                    if running.current >= index && running.current > 0 {
-                        running.current = running.current.saturating_sub(1);
-                    }
-                }
+                TabAction::Close => running.tabs.close(params.index).await?,
             }
             let mut out = String::new();
-            for (index, page) in running.context.pages().await?.iter().enumerate() {
-                let marker = if index == running.current { "*" } else { " " };
-                let url = page
+            for (position, tab) in running.tabs.list().await?.iter().enumerate() {
+                let url = tab
+                    .page
                     .url()
                     .await
                     .unwrap_or_else(|error| format!("({error:#})"));
-                writeln!(out, "{marker} {index}: {url}").context("format")?;
+                let current = tab.at == running.tabs.current;
+                writeln!(out, "{}", line(current, position, &tab.at, &url)).context("format")?;
             }
             Ok(out)
         }

@@ -3,6 +3,7 @@ mod params;
 mod profile;
 mod server;
 mod session;
+mod tabs;
 
 use anyhow::Context;
 use clap::Parser;
