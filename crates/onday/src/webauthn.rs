@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use http::Method;
 use serde::Serialize;
 use thirtyfour::common::command::FormatRequestData;
-use thirtyfour::prelude::WebDriver;
 use thirtyfour::{RequestData, SessionId};
 
-/// Options for [`add_virtual_authenticator`]. The default models a platform
+use crate::Page;
+
+/// Options for [`Page::add_virtual_authenticator`]. The default models a platform
 /// authenticator: CTAP2 over `internal`, resident keys, verification that succeeds.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,28 +59,44 @@ impl FormatRequestData for RemoveVirtualAuthenticator {
     }
 }
 
-/// Attach a virtual authenticator to the session and return its id.
-pub async fn add_virtual_authenticator(
-    driver: &WebDriver,
-    options: VirtualAuthenticatorOptions,
-) -> Result<String> {
-    let body = serde_json::to_value(&options).context("serialize authenticator options")?;
-    driver
-        .cmd(AddVirtualAuthenticator(body))
-        .await
-        .context("add virtual authenticator")?
-        .value::<String>()
-        .context("read add-virtual-authenticator response value")
+/// A virtual authenticator attached to a page's tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticator {
+    id: String,
 }
 
-/// Detach an authenticator from [`add_virtual_authenticator`], discarding its credentials.
-pub async fn remove_virtual_authenticator(
-    driver: &WebDriver,
-    authenticator_id: &str,
-) -> Result<()> {
-    driver
-        .cmd(RemoveVirtualAuthenticator(authenticator_id.to_string()))
-        .await
-        .context("remove virtual authenticator")?;
-    Ok(())
+impl Authenticator {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Page {
+    /// Attach a virtual authenticator to this page's tab. It answers the
+    /// ceremonies of this tab only, so attach it from the tab that runs them.
+    pub async fn add_virtual_authenticator(
+        &self,
+        options: VirtualAuthenticatorOptions,
+    ) -> Result<Authenticator> {
+        let body = serde_json::to_value(&options).context("serialize authenticator options")?;
+        let id = self
+            .driver_on_tab()
+            .await?
+            .cmd(AddVirtualAuthenticator(body))
+            .await
+            .context("add virtual authenticator")?
+            .value::<String>()
+            .context("read add-virtual-authenticator response value")?;
+        Ok(Authenticator { id })
+    }
+
+    /// Detach an authenticator, discarding its credentials.
+    pub async fn remove_virtual_authenticator(&self, authenticator: &Authenticator) -> Result<()> {
+        self.driver_on_tab()
+            .await?
+            .cmd(RemoveVirtualAuthenticator(authenticator.id.clone()))
+            .await
+            .context("remove virtual authenticator")?;
+        Ok(())
+    }
 }

@@ -68,7 +68,12 @@ document.
 scripts, a readiness predicate for `WaitUntil::Ready`, hover-reveal containers, and which
 fetches count as in-flight writes.
 
-`onday::dom::WebDriverExt` offers the same waiting helpers on a raw `thirtyfour::WebDriver`.
+The API exposes no WebDriver client type: cookies (`Cookie`), the page-load strategy, WebAuthn
+virtual authenticators (`Page::add_virtual_authenticator`), network idle
+(`Page::wait_for_network_idle`) and route warming (`onday::warm`) are all onday's own.
+`onday::install_driver` resolves the driver matching a local browser, downloading it into
+`$ONDAY_DRIVERS_DIR` (default `<user cache>/onday/drivers`) when it is missing, and
+`onday::cached_drivers` lists the ones already there.
 
 ## MCP server
 
@@ -92,16 +97,13 @@ The browser window is visible by default; `--headless` (or `ONDAY_HEADLESS`) hid
 session another live process holds is reported by the first browser tool. Until the
 directory exists, the server logs to stderr.
 
-`--profile-from <session>` (or `ONDAY_PROFILE_FROM`) starts a new session's browser
-from a copy of an earlier session's profile for the engine it launches: installed
-extensions with their own storage, cookies, saved logins and site storage carry over,
-and the earlier session keeps its original. The earlier session must not be open in
-another process while it is copied, and the new session must not have a profile of
-its own yet.
-
 The tools follow playwright-mcp's names, plus:
 
-- `browser_launch` switches engine at runtime.
+- `browser_launch` switches engine at runtime. With `profile_from`, it replaces this
+  session's profile for that engine with a copy of another session's: installed
+  extensions with their own storage, cookies, saved logins and site storage carry
+  over, and the other session keeps its original. That session must not be open in
+  another process.
 - `browser_route` and `browser_unroute` intercept requests.
 - `browser_status` reports the session and the browser's health, without waiting on
   the browser.

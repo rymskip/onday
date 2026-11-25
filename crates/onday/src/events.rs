@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thirtyfour::bidi::events::{
     ContextCreated, ContextDestroyed, DomContentLoaded, FragmentNavigated, Load, NavigationAborted,
-    NavigationCommitted, NavigationFailed, NavigationStarted, UserPromptClosed, UserPromptOpened,
+    NavigationCommitted, NavigationFailed, UserPromptClosed, UserPromptOpened,
 };
 use thirtyfour::bidi::{BidiEvent, BrowsingContextId, NavigationId, RawEvent, RawEventStream};
 use tokio::sync::{broadcast, watch};
@@ -17,7 +17,8 @@ use tokio::task::JoinHandle;
 
 use crate::channel::BidiChannel;
 use crate::proto::{
-    BeforeRequestSentEvent, FetchErrorEvent, LogEntryEvent, ResponseCompletedEvent, WireHeader,
+    BeforeRequestSentEvent, FetchErrorEvent, LogEntryEvent, NavigationStartedEvent,
+    ResponseCompletedEvent, WireHeader,
 };
 use crate::route::RouteTable;
 
@@ -79,11 +80,22 @@ pub struct NetworkEntry {
     pub duration_ms: Option<u64>,
     pub request_headers: Vec<Header>,
     pub response_headers: Vec<Header>,
+    /// What started the request, as the browser names it (`fetch`,
+    /// `xmlhttprequest`, `script`, `img`, ...); `None` when it does not say.
+    pub initiator_type: Option<String>,
 }
 
 impl NetworkEntry {
     pub fn is_settled(&self) -> bool {
         self.status.is_some() || self.error.is_some()
+    }
+
+    /// Whether the page's own code made the request with `fetch` or XHR.
+    pub fn is_fetch(&self) -> bool {
+        matches!(
+            self.initiator_type.as_deref(),
+            Some("fetch" | "xmlhttprequest")
+        )
     }
 }
 
@@ -165,6 +177,8 @@ pub(crate) struct PageEvents {
     pub(crate) network_tx: broadcast::Sender<NetworkEntry>,
     pub(crate) dialog_tx: broadcast::Sender<Dialog>,
     pub(crate) navigation: watch::Sender<NavigationState>,
+    /// Bumped whenever a request starts or settles, so a waiter can wake on either.
+    pub(crate) activity: watch::Sender<u64>,
     pub(crate) routes: RouteTable,
 }
 
@@ -178,6 +192,7 @@ impl PageEvents {
             network_tx: broadcast::channel(1024).0,
             dialog_tx: broadcast::channel(16).0,
             navigation: watch::channel(NavigationState::default()).0,
+            activity: watch::channel(0).0,
             routes: RouteTable::default(),
         })
     }
@@ -222,6 +237,7 @@ impl PageEvents {
         url: String,
         started: u64,
         headers: Vec<Header>,
+        initiator_type: Option<String>,
     ) {
         let mut history = self.lock_history();
         if history
@@ -247,10 +263,28 @@ impl PageEvents {
             duration_ms: None,
             request_headers: headers,
             response_headers: Vec::new(),
+            initiator_type,
         });
         if history.network.len() > NETWORK_CAP {
             history.network.pop_front();
         }
+        drop(history);
+        self.bump_activity();
+    }
+
+    fn bump_activity(&self) {
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// URLs of the fetch and XHR requests still in flight.
+    pub(crate) fn open_fetches(&self) -> Vec<String> {
+        self.lock_history()
+            .network
+            .iter()
+            .filter(|entry| entry.is_fetch() && !entry.is_settled())
+            .map(|entry| entry.url.clone())
+            .collect()
     }
 
     pub(crate) fn request_settled(&self, id: &str, settle: impl FnOnce(&mut NetworkEntry)) {
@@ -270,6 +304,7 @@ impl PageEvents {
             })
         };
         if let Some(entry) = settled {
+            self.bump_activity();
             publish(&self.network_tx, entry);
         }
     }
@@ -284,6 +319,7 @@ impl PageEvents {
             history.network.pop_front();
         }
         drop(history);
+        self.bump_activity();
         publish(&self.network_tx, entry);
     }
 
@@ -416,7 +452,7 @@ impl EventHub {
         bidi.session()
             .subscribe_many(
                 [
-                    NavigationStarted::METHOD,
+                    NavigationStartedEvent::METHOD,
                     NavigationCommitted::METHOD,
                     FragmentNavigated::METHOD,
                     DomContentLoaded::METHOD,
@@ -571,6 +607,7 @@ impl EventHub {
             event.request.url.clone(),
             event.timestamp,
             event.request.headers.iter().map(Header::from).collect(),
+            event.request.initiator_type.clone(),
         );
         if event.is_blocked {
             crate::route::dispatch(self.bidi.clone(), context, page, event);
@@ -656,14 +693,16 @@ impl EventHub {
     fn on_navigation(self: &Arc<Self>, event: RawEvent) {
         let method = event.method.as_str();
         let decoded = match method {
-            NavigationStarted::METHOD => decode::<NavigationStarted>(event.params).map(|started| {
-                (
-                    started.context,
-                    started.navigation,
-                    started.url,
-                    Step::Started,
-                )
-            }),
+            NavigationStartedEvent::METHOD => {
+                decode::<NavigationStartedEvent>(event.params).map(|started| {
+                    (
+                        started.context,
+                        started.navigation,
+                        started.url.unwrap_or_default(),
+                        Step::Started,
+                    )
+                })
+            }
             NavigationCommitted::METHOD => {
                 decode::<NavigationCommitted>(event.params).map(|committed| {
                     let step = Step::Reached(LoadPhase::Committed);
@@ -796,7 +835,21 @@ fn now_ms() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DialogPolicy, PageEvents, now_ms};
+    use super::{DialogPolicy, PageEvents, decode, now_ms};
+    use crate::proto::NavigationStartedEvent;
+
+    /// Firefox starts a history traversal without the URL the spec requires.
+    #[test]
+    fn a_navigation_start_without_a_url_still_decodes() {
+        let started: NavigationStartedEvent = decode(serde_json::json!({
+            "context": "tab-1",
+            "navigation": "nav-1",
+            "timestamp": 1,
+        }))
+        .expect("a start without a URL decodes");
+        assert_eq!(started.context.as_str(), "tab-1");
+        assert_eq!(started.url, None);
+    }
 
     #[test]
     fn a_settled_request_carries_when_it_settled() {
@@ -808,7 +861,9 @@ mod tests {
             "http://127.0.0.1/api/thing".to_string(),
             started,
             Vec::new(),
+            Some("fetch".to_string()),
         );
+        assert_eq!(events.open_fetches(), ["http://127.0.0.1/api/thing"]);
         let open = events.network_after(0);
         assert_eq!(open.first().and_then(|entry| entry.settled_at), None);
 
@@ -823,5 +878,27 @@ mod tests {
             "settled at {at}, before it started at {started}"
         );
         assert_eq!(entry.duration_ms, Some(at.saturating_sub(started)));
+        assert!(events.open_fetches().is_empty());
+    }
+
+    #[test]
+    fn only_fetch_and_xhr_count_as_open() {
+        let events = PageEvents::new(DialogPolicy::default());
+        for (id, initiator) in [
+            ("script", Some("script")),
+            ("unknown", None),
+            ("xhr", Some("xmlhttprequest")),
+        ] {
+            events.request_started(
+                id.to_string(),
+                "GET".to_string(),
+                format!("http://127.0.0.1/{id}"),
+                0,
+                Vec::new(),
+                initiator.map(str::to_string),
+            );
+        }
+        assert_eq!(events.open_fetches(), ["http://127.0.0.1/xhr"]);
+        assert_eq!(*events.activity.borrow(), 3);
     }
 }

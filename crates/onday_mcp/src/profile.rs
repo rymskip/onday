@@ -1,9 +1,9 @@
-//! Starting a new session's browser from a copy of an earlier session's profile.
+//! Launching a browser from a copy of another session's profile.
 //!
 //! A profile holds everything a browser keeps between runs: installed extensions
 //! with their own storage and service workers, cookies, saved logins, local
 //! storage and IndexedDB. The copy is the whole profile less the entries a running
-//! browser claims it with, so the new browser opens it as its own and the earlier
+//! browser claims it with, so the new browser opens it as its own and the other
 //! session keeps its original untouched.
 
 use std::fs::{OpenOptions, TryLockError};
@@ -30,7 +30,7 @@ const CLAIMS: [&str; 8] = [
     "lock",
 ];
 
-/// The earlier session a new session's profile starts from.
+/// The session a browser's profile is copied from.
 pub struct ProfileSource {
     id: String,
     root: PathBuf,
@@ -45,10 +45,10 @@ impl ProfileSource {
         &self.id
     }
 
-    /// Copy this session's `engine` profile to `target`, which does not exist yet.
-    /// The session's lock is held for the copy, so no browser of its own writes the
-    /// profile meanwhile, and the copy lands under its name only once complete.
-    pub fn copy_to(&self, engine: Engine, target: &Path) -> Result<()> {
+    /// Replace `target` with a copy of this session's `engine` profile. The
+    /// session's lock is held for the copy, so no browser of its own writes the
+    /// profile meanwhile, and `target` changes only once the copy is complete.
+    pub fn replace(&self, engine: Engine, target: &Path) -> Result<()> {
         if !self.root.is_dir() {
             bail!(
                 "there is no session {} at {} to start the profile from",
@@ -69,7 +69,7 @@ impl ProfileSource {
                     .map(|pid| pid.trim().to_string())
                     .unwrap_or_else(|error| format!("unreadable: {error}"));
                 bail!(
-                    "session {} is open in another onday_mcp (pid {holder}); close it before starting from its profile",
+                    "session {} is open in another onday_mcp (pid {holder}); close it before copying its profile",
                     self.id
                 );
             }
@@ -86,10 +86,13 @@ impl ProfileSource {
             .file_name()
             .with_context(|| format!("{} names no profile", target.display()))?;
         let partial = target.with_file_name(format!("{}.partial", name.to_string_lossy()));
-        // Left by a copy interrupted before it was renamed into place.
-        if partial.exists() {
-            std::fs::remove_dir_all(&partial)
-                .with_context(|| format!("clear the unfinished copy {}", partial.display()))?;
+        let replaced = target.with_file_name(format!("{}.replaced", name.to_string_lossy()));
+        // Left by a replacement interrupted part way.
+        for leftover in [&partial, &replaced] {
+            if leftover.exists() {
+                std::fs::remove_dir_all(leftover)
+                    .with_context(|| format!("clear {}", leftover.display()))?;
+            }
         }
         copy_tree(&source, &partial, true).with_context(|| {
             format!(
@@ -98,8 +101,21 @@ impl ProfileSource {
                 source.display()
             )
         })?;
+        let had_profile = target.exists();
+        if had_profile {
+            std::fs::rename(target, &replaced)
+                .with_context(|| format!("move {} aside", target.display()))?;
+        }
         std::fs::rename(&partial, target)
-            .with_context(|| format!("move the copied profile to {}", target.display()))
+            .with_context(|| format!("move the copied profile to {}", target.display()))?;
+        // The copy is in place; a profile left behind here is cleared by the next replacement.
+        if had_profile && let Err(error) = std::fs::remove_dir_all(&replaced) {
+            tracing::warn!(
+                "removing the replaced profile {} failed: {error}",
+                replaced.display()
+            );
+        }
+        Ok(())
     }
 }
 

@@ -12,8 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use onday::prelude::*;
 use onday::{
-    AppHooks, BrowserGone, DialogPolicy, Fulfill, Health, Protocol, ProtocolPreference,
-    RouteAction, ScreenshotOptions, StrictModeViolation,
+    AppHooks, BrowserGone, Cookie, DialogPolicy, Fulfill, Health, Protocol, ProtocolPreference,
+    RouteAction, SameSite, ScreenshotOptions, StrictModeViolation, VirtualAuthenticatorOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -87,6 +87,9 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
             }
             // The restarting frame carries how many restarts are left in its query.
             let page = path.split('?').next().unwrap_or("/");
+            if page == "/api/slow" {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
             let (status, kind, body) = match page {
                 "/" => ("200 OK", "text/html; charset=utf-8", index.to_string()),
                 "/restart" => ("200 OK", "text/html; charset=utf-8", RESTART.to_string()),
@@ -121,7 +124,7 @@ async fn accept(listener: tokio::net::TcpListener, index: Arc<String>, remote_or
                     "<!doctype html><title>Leaving</title><script>location.replace('/second')</script>"
                         .to_string(),
                 ),
-                "/api/data" => (
+                "/api/data" | "/api/slow" => (
                     "200 OK",
                     "application/json",
                     r#"{"value":"real"}"#.to_string(),
@@ -251,11 +254,10 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         "init script did not run"
     );
 
-    // Raw-driver evaluation takes expressions, async IIFEs and statement one-liners.
-    let driver = page.driver();
-    let title: String = driver.evaluate("document.title").await?;
+    // Evaluation takes expressions, async IIFEs and statement one-liners.
+    let title: String = page.evaluate("document.title").await?;
     ensure!(title == "Onday fixture", "document.title gave {title:?}");
-    let awaited: Option<String> = driver
+    let awaited: Option<String> = page
         .evaluate(
             "(async () => { await new Promise(r => setTimeout(r, 10)); return 'awaited'; })()",
         )
@@ -264,16 +266,16 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         awaited.as_deref() == Some("awaited"),
         "async IIFE gave {awaited:?}"
     );
-    let defined: String = driver
+    let defined: String = page
         .evaluate("Object.defineProperty(window, '__ondayProbe', { value: 1 });\n")
         .await?;
     ensure!(
         defined == "[object Window]",
         "unserializable results fall back to String(): {defined:?}"
     );
-    let probe: u32 = driver.evaluate("window.__ondayProbe").await?;
+    let probe: u32 = page.evaluate("window.__ondayProbe").await?;
     ensure!(probe == 1, "the statement did not run");
-    let nothing: Option<String> = driver.evaluate("null").await?;
+    let nothing: Option<String> = page.evaluate("null").await?;
     ensure!(nothing.is_none(), "null should decode as None");
 
     // Over BiDi the runtime lives in its own sandbox, out of reach of whatever the
@@ -391,17 +393,19 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         open.len() == 2 && open.contains(&page) && open.contains(&sibling),
         "a tab opened from the page's context is not listed beside it"
     );
-    // The raw driver follows whichever tab asks for it.
-    let on_sibling = sibling.driver_on_tab().await?.current_url().await?;
+    // Each tab takes a virtual authenticator of its own.
+    let on_sibling = sibling
+        .add_virtual_authenticator(VirtualAuthenticatorOptions::default())
+        .await?;
+    let on_page = page
+        .add_virtual_authenticator(VirtualAuthenticatorOptions::default())
+        .await?;
     ensure!(
-        on_sibling.as_str() == "about:blank",
-        "the driver asked for the new tab is on {on_sibling}"
+        on_sibling != on_page,
+        "two tabs were handed the same authenticator {on_page:?}"
     );
-    let on_page = page.driver_on_tab().await?.current_url().await?;
-    ensure!(
-        on_page.as_str() == page.url().await?,
-        "the driver asked for the first tab is on {on_page}"
-    );
+    sibling.remove_virtual_authenticator(&on_sibling).await?;
+    page.remove_virtual_authenticator(&on_page).await?;
     sibling.close().await?;
     // Every match gets a locator of its own.
     let duplicates = page.get_by_test_id("dup").all().await?;
@@ -436,8 +440,7 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         page_scroll_after == page_scroll,
         "the wheel over the scroller moved the page from {page_scroll} to {page_scroll_after}"
     );
-    typing(&page, Typist::Driver).await?;
-    typing(&page, Typist::Locator).await?;
+    typing(&page).await?;
 
     // Snapshot refs.
     let snapshot = page.snapshot().await?;
@@ -657,22 +660,29 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
     page.go_back().await?;
     expect_page(&page).to_have_url(&format!("{base}/")).await?;
 
+    network_idle(browser, &page, base).await?;
+
     // Isolation.
     context
-        .add_cookies(vec![{
-            let mut cookie = onday::thirtyfour::Cookie::new("flavor", "choc");
-            cookie.domain = Some("127.0.0.1".to_string());
-            cookie.path = Some("/".to_string());
-            cookie
-        }])
+        .add_cookies(vec![
+            Cookie::new("flavor", "choc")
+                .domain("127.0.0.1")
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Lax),
+        ])
         .await?;
+    let cookies = context.cookies().await?;
+    let flavor = cookies
+        .iter()
+        .find(|cookie| cookie.name == "flavor")
+        .context("cookie missing")?;
     ensure!(
-        context
-            .cookies()
-            .await?
-            .iter()
-            .any(|cookie| cookie.name == "flavor"),
-        "cookie missing"
+        flavor.value == "choc"
+            && flavor.path.as_deref() == Some("/")
+            && flavor.http_only == Some(true)
+            && flavor.same_site == Some(SameSite::Lax),
+        "the cookie came back as {flavor:?}"
     );
     let other = browser.new_context(ContextOptions::default()).await?;
     let other_page = other.page().await?;
@@ -686,6 +696,31 @@ async fn exercise(browser: &Browser, base: &str) -> Result<()> {
         "cookie leaked across contexts"
     );
     other.close().await?;
+    Ok(())
+}
+
+/// Network idle waits out a fetch the page left open, and names it when the
+/// deadline passes first. Classic sees no request until it finishes.
+async fn network_idle(browser: &Browser, page: &Page, base: &str) -> Result<()> {
+    page.goto(base, WaitUntil::Load)
+        .await
+        .context("open the page whose fetch is left open")?;
+    page.evaluate::<bool>("(() => { window.__slow = fetch('/api/slow'); return true; })()")
+        .await?;
+    if browser.protocol() == Protocol::Bidi {
+        let held = page
+            .wait_for_network_idle(Duration::from_millis(200), Duration::from_millis(300))
+            .await
+            .err()
+            .context("network idle passed over a fetch still in flight")?;
+        ensure!(
+            format!("{held:#}").contains("/api/slow"),
+            "the idle failure should name the open fetch: {held:#}"
+        );
+    }
+    page.wait_for_network_idle(Duration::from_millis(200), Duration::from_secs(5))
+        .await
+        .context("the page never went idle after its fetch answered")?;
     Ok(())
 }
 
@@ -750,61 +785,40 @@ async fn redirects(page: &Page, base: &str) -> Result<()> {
     Ok(())
 }
 
-/// `WebDriverExt::type_into_selector` acts like a person and checks what the field holds.
-/// The two ways to type into a field.
-#[derive(Debug, Clone, Copy)]
-enum Typist {
-    /// The raw session's `type_into_selector`.
-    Driver,
-    /// A locator's `type_into`.
-    Locator,
-}
-
-impl Typist {
-    async fn type_into(self, page: &Page, selector: &str, text: &str) -> Result<()> {
-        match self {
-            Typist::Driver => {
-                page.driver()
-                    .type_into_selector(selector, text, Duration::from_secs(10))
-                    .await
-            }
-            Typist::Locator => page.locator(selector).type_into(text).await,
-        }
-    }
-}
-
-async fn typing(page: &Page, typist: Typist) -> Result<()> {
+/// A locator types like a person and checks what the field holds.
+async fn typing(page: &Page) -> Result<()> {
     // A label covering the input forwards the pointer click's focus to it.
-    typist.type_into(page, "#float", "new").await?;
+    page.locator("#float").type_into("new").await?;
     expect(&page.locator("#float")).to_have_value("new").await?;
-    typist.type_into(page, "#wrapped", "Grace").await?;
+    page.locator("#wrapped").type_into("Grace").await?;
     expect(&page.locator("#wrapped"))
         .to_have_value("Grace")
         .await?;
     // A mask reformats both the prefill and the typed digits.
-    typist.type_into(page, "#phone", "5551234567").await?;
+    page.locator("#phone").type_into("5551234567").await?;
     expect(&page.locator("#phone"))
         .to_have_value("(555) 123-4567")
         .await?;
     // One input event for the clear, one per typed key.
     let inputs_before: u32 = page.evaluate("window.__searchInputs || 0").await?;
-    typist.type_into(page, "#search", "ab").await?;
+    page.locator("#search").type_into("ab").await?;
     expect(&page.locator("#search")).to_have_value("ab").await?;
     let inputs: u32 = page.evaluate("window.__searchInputs").await?;
     let typed = inputs.saturating_sub(inputs_before);
     ensure!(typed == 3, "#search saw {typed} input events, expected 3");
-    typist.type_into(page, "#qty", "40").await?;
+    page.locator("#qty").type_into("40").await?;
     expect(&page.locator("#qty")).to_have_value("40").await?;
-    typist.type_into(page, "#notes", "only line").await?;
+    page.locator("#notes").type_into("only line").await?;
     expect(&page.locator("#notes"))
         .to_have_value("only line")
         .await?;
-    typist.type_into(page, "#editor", "typed").await?;
+    page.locator("#editor").type_into("typed").await?;
     expect(&page.locator("#editor"))
         .to_have_text("typed")
         .await?;
-    let covered = typist
-        .type_into(page, "#covered", "x")
+    let covered = page
+        .locator("#covered")
+        .type_into("x")
         .await
         .err()
         .context("typing into a field under a toast should fail")?;
@@ -815,27 +829,26 @@ async fn typing(page: &Page, typist: Typist) -> Result<()> {
     // A box that clips its overflow, which no scrollbar reaches, shows only a
     // strip of the field and leaves what lies beneath the box under its centre.
     // The locator aims at the strip a person sees and never scrolls the box.
-    if let Typist::Locator = typist {
-        // Typing then scrolls the box itself, as it does for a person: the
-        // browser keeps the caret in view. So the box is checked after the press.
-        page.locator("#clipped")
-            .click()
-            .await
-            .context("click the strip of #clipped a person sees")?;
-        let scrolled: i64 = page
-            .evaluate("Math.round(document.getElementById('clip-box').scrollTop)")
-            .await?;
-        ensure!(
-            scrolled == 0,
-            "pressing #clipped scrolled its clipping box {scrolled}px, which no person can scroll"
-        );
-        typist.type_into(page, "#clipped", "seen").await?;
-        expect(&page.locator("#clipped"))
-            .to_have_value("seen")
-            .await?;
-    }
-    let dated = typist
-        .type_into(page, "#when", "10012026")
+    // Typing then scrolls the box itself, as it does for a person: the browser
+    // keeps the caret in view. So the box is checked after the press.
+    page.locator("#clipped")
+        .click()
+        .await
+        .context("click the strip of #clipped a person sees")?;
+    let scrolled: i64 = page
+        .evaluate("Math.round(document.getElementById('clip-box').scrollTop)")
+        .await?;
+    ensure!(
+        scrolled == 0,
+        "pressing #clipped scrolled its clipping box {scrolled}px, which no person can scroll"
+    );
+    page.locator("#clipped").type_into("seen").await?;
+    expect(&page.locator("#clipped"))
+        .to_have_value("seen")
+        .await?;
+    let dated = page
+        .locator("#when")
+        .type_into("10012026")
         .await
         .err()
         .context("typing into a date input should fail")?;
@@ -914,13 +927,9 @@ enum Vanish {
 
 /// Close DevTools targets through the browser's own debugging endpoint.
 async fn close_targets(browser: &Browser, vanish: Vanish) -> Result<()> {
-    let capabilities = browser.driver().handle().capabilities();
-    let address = capabilities
-        .get("goog:chromeOptions")
-        .and_then(|options| options.get("debuggerAddress"))
-        .and_then(|address| address.as_str())
-        .context("chromedriver reported no debuggerAddress")?
-        .to_string();
+    let address = browser
+        .debugger_address()
+        .context("chromedriver reported no debuggerAddress")?;
     let listing = http_get(&address, "/json/list").await?;
     let targets: Vec<DevToolsTarget> =
         serde_json::from_str(&listing).with_context(|| format!("parse /json/list: {listing}"))?;
@@ -1065,6 +1074,58 @@ async fn chromium_over_bidi() -> Result<()> {
 #[ignore = "needs Chrome; run with --ignored"]
 async fn chromium_over_classic() -> Result<()> {
     scenario(Engine::Chromium, ProtocolPreference::Classic).await
+}
+
+/// A headed browser whose window is minimized stops rendering frames, so any wait
+/// paced by animation frames never ends. Clicks must still go through.
+async fn click_in_a_hidden_window(engine: Engine, preference: ProtocolPreference) -> Result<()> {
+    install_tracing();
+    let base = serve().await?;
+    let browser = Browser::launch(launch_options(engine, preference).headed()).await?;
+    let clicked = async {
+        let page = browser
+            .default_context(ContextOptions {
+                hooks: Some(Arc::new(FixtureHooks)),
+                ..ContextOptions::default()
+            })
+            .await?
+            .page()
+            .await?;
+        page.set_default_timeout(Duration::from_secs(10));
+        page.goto(&base, WaitUntil::Load).await?;
+        page.minimize_window().await?;
+        let visibility: String = page.evaluate("document.visibilityState").await?;
+        ensure!(
+            visibility == "hidden",
+            "the minimized page reports {visibility:?}, so the test hides nothing"
+        );
+        page.get_by_test_id("increment").click().await?;
+        expect(&page.get_by_test_id("count"))
+            .to_have_text("1")
+            .await
+    }
+    .await;
+    let closed = browser.close().await;
+    clicked?;
+    closed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome and a display; run with --ignored"]
+async fn chromium_clicks_in_a_hidden_window_over_bidi() -> Result<()> {
+    click_in_a_hidden_window(Engine::Chromium, ProtocolPreference::Auto).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Chrome and a display; run with --ignored"]
+async fn chromium_clicks_in_a_hidden_window_over_classic() -> Result<()> {
+    click_in_a_hidden_window(Engine::Chromium, ProtocolPreference::Classic).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Firefox and a display; run with --ignored"]
+async fn firefox_clicks_in_a_hidden_window_over_bidi() -> Result<()> {
+    click_in_a_hidden_window(Engine::Firefox, ProtocolPreference::Auto).await
 }
 
 #[tokio::test(flavor = "multi_thread")]

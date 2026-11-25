@@ -33,13 +33,13 @@ impl Engine {
     }
 
     /// Capabilities for a new session of this engine.
-    pub fn capabilities(self, options: &LaunchOptions) -> Result<Capabilities> {
+    pub(crate) fn capabilities(self, options: &LaunchOptions) -> Result<Capabilities> {
         let mut caps = match self {
             Engine::Chromium => chromium_capabilities(options)?,
             Engine::Firefox => firefox_capabilities(options)?,
             Engine::Webkit => webkit_capabilities(options)?,
         };
-        caps.set_page_load_strategy(options.page_load_strategy.clone())
+        caps.set("pageLoadStrategy", options.page_load_strategy.as_str())
             .context("set page load strategy")?;
         // The W3C key; thirtyfour's helper only writes the legacy one.
         caps.set("unhandledPromptBehavior", options.prompt_behavior.as_str())
@@ -85,6 +85,16 @@ fn chromium_capabilities(options: &LaunchOptions) -> Result<Capabilities> {
     // Small /dev/shm on containers and servers crashes the renderer; spill to /tmp.
     caps.add_arg("--disable-dev-shm-usage")
         .context("dev-shm arg")?;
+    // As Playwright launches it: a window behind others keeps rendering at full
+    // speed instead of being treated as hidden, so pages and waits behave as seen.
+    for arg in [
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+    ] {
+        caps.add_arg(arg)
+            .with_context(|| format!("chrome arg {arg}"))?;
+    }
     if let Some((width, height)) = options.window_size {
         caps.add_arg(&format!("--window-size={width},{height}"))
             .context("window-size arg")?;

@@ -59,7 +59,7 @@ fn copies_the_whole_profile_but_its_claims() {
     std::fs::create_dir_all(base.join("after")).expect("create the new session");
 
     source(&base)
-        .copy_to(Engine::Chromium, &target)
+        .replace(Engine::Chromium, &target)
         .expect("copy the profile");
 
     let read = |relative: &str| std::fs::read_to_string(target.join(relative)).expect(relative);
@@ -106,7 +106,7 @@ fn refuses_a_session_another_process_holds() {
     let target = base.join("after/profile-chromium");
 
     let refusal = source(&base)
-        .copy_to(Engine::Chromium, &target)
+        .replace(Engine::Chromium, &target)
         .expect_err("a held session was copied");
 
     assert!(
@@ -125,7 +125,7 @@ fn refuses_an_engine_the_session_has_no_profile_for() {
     let target = base.join("after/profile-firefox");
 
     let refusal = source(&base)
-        .copy_to(Engine::Firefox, &target)
+        .replace(Engine::Firefox, &target)
         .expect_err("copied a profile that does not exist");
 
     assert!(
@@ -142,7 +142,7 @@ fn refuses_a_session_that_does_not_exist() {
     let missing = ProfileSource::new("never".to_string(), base.join("never"));
 
     let refusal = missing
-        .copy_to(Engine::Chromium, &base.join("after/profile-chromium"))
+        .replace(Engine::Chromium, &base.join("after/profile-chromium"))
         .expect_err("copied from no session");
 
     assert!(
@@ -163,11 +163,40 @@ fn replaces_an_unfinished_copy() {
     let target = base.join("after/profile-chromium");
 
     source(&base)
-        .copy_to(Engine::Chromium, &target)
+        .replace(Engine::Chromium, &target)
         .expect("copy over the unfinished one");
 
     assert!(!target.join("stale").exists());
     assert!(target.join("Default/Cookies").exists());
+    assert!(!base.join("after/profile-chromium.partial").exists());
+    std::fs::remove_dir_all(&base).expect("clean up");
+}
+
+#[test]
+fn replaces_the_profile_already_there() {
+    let base = scratch("existing");
+    chromium_profile(&base);
+    write(
+        &base.join("after/profile-chromium/Default/Cookies"),
+        "own cookies",
+    );
+    write(&base.join("after/profile-chromium/own-only"), "dropped");
+    write(
+        &base.join("after/profile-chromium.replaced/stale"),
+        "left by an interrupted replacement",
+    );
+    let target = base.join("after/profile-chromium");
+
+    source(&base)
+        .replace(Engine::Chromium, &target)
+        .expect("replace the profile");
+
+    assert_eq!(
+        std::fs::read_to_string(target.join("Default/Cookies")).expect("cookies"),
+        "cookies"
+    );
+    assert!(!target.join("own-only").exists());
+    assert!(!base.join("after/profile-chromium.replaced").exists());
     assert!(!base.join("after/profile-chromium.partial").exists());
     std::fs::remove_dir_all(&base).expect("clean up");
 }
@@ -282,7 +311,7 @@ async fn a_copied_chromium_profile_keeps_cookies_and_storage() -> Result<()> {
 
     let copied = base.join("after/profile-chromium");
     std::fs::create_dir_all(base.join("after")).context("create the new session")?;
-    source(&base).copy_to(Engine::Chromium, &copied)?;
+    source(&base).replace(Engine::Chromium, &copied)?;
     let stored: Stored = serde_json::from_value(visit(&copied, &origin, READ).await?)
         .context("read what the copied profile holds")?;
 

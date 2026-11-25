@@ -15,7 +15,8 @@ use thirtyfour::bidi::modules::browsing_context::{
 };
 use thirtyfour::bidi::modules::network::{AddIntercept, InterceptPhase, RemoveIntercept};
 use thirtyfour::bidi::modules::script::{GetRealms, Target};
-use thirtyfour::bidi::{BiDi, BidiError, BrowsingContextId, Empty};
+use thirtyfour::bidi::{BidiError, BrowsingContextId, Empty};
+use thirtyfour::error::WebDriverErrorInner;
 use thirtyfour::{WebDriver, WebElement, WindowHandle};
 use tokio::sync::broadcast;
 
@@ -397,15 +398,14 @@ impl Page {
         &self.context.hooks
     }
 
-    /// The raw thirtyfour driver behind this page.
-    pub fn driver(&self) -> &WebDriver {
+    pub(crate) fn driver(&self) -> &WebDriver {
         &self.context.session.driver
     }
 
     /// The raw driver with the session's own window switched to this tab, for
     /// the Classic-only commands BiDi has no word for, such as WebAuthn's
     /// virtual authenticator. A tab's BiDi context id is its window handle.
-    pub async fn driver_on_tab(&self) -> Result<&WebDriver> {
+    pub(crate) async fn driver_on_tab(&self) -> Result<&WebDriver> {
         let handle = match &self.inner.target {
             PageTarget::Classic(handle) => handle.clone(),
             PageTarget::Bidi(context) => WindowHandle::from(context.as_str()),
@@ -422,15 +422,19 @@ impl Page {
         Ok(self.driver())
     }
 
-    /// The raw BiDi connection, when negotiated.
-    pub fn bidi(&self) -> Option<&BiDi> {
-        self.context.session.bidi.as_ref().map(BidiChannel::raw)
+    /// Minimize the window this page's tab lives in.
+    pub async fn minimize_window(&self) -> Result<()> {
+        self.driver_on_tab()
+            .await?
+            .minimize_window()
+            .await
+            .context("minimize the window")
     }
 
-    /// The BiDi browsing context id of this page.
-    pub fn context_id(&self) -> Option<&BrowsingContextId> {
+    /// The BiDi browsing context id of this page; `None` over Classic.
+    pub fn context_id(&self) -> Option<&str> {
         match &self.inner.target {
-            PageTarget::Bidi(id) => Some(id),
+            PageTarget::Bidi(id) => Some(id.as_str()),
             PageTarget::Classic(_) => None,
         }
     }
@@ -515,11 +519,7 @@ impl Page {
         }
         match &self.inner.target {
             PageTarget::Bidi(context) => {
-                let wanted = match (wait, &ready) {
-                    (WaitUntil::Commit, _) | (WaitUntil::Ready, Some(_)) => None,
-                    (WaitUntil::DomContentLoaded, _) => Some(LoadPhase::DomContentLoaded),
-                    (WaitUntil::Load, _) | (WaitUntil::Ready, None) => Some(LoadPhase::Loaded),
-                };
+                let wanted = load_phase(wait, ready.is_some());
                 let since = self.inner.events.navigation.borrow().started;
                 // Navigate's own wait tracks only the navigation it started, which a
                 // script redirect replaces; the settle below follows the replacement.
@@ -637,8 +637,22 @@ impl Page {
     }
 
     pub async fn reload(&self) -> Result<()> {
+        self.reload_until(WaitUntil::Load).await
+    }
+
+    /// Reload, returning once `wait` holds. Over Classic the session's page-load
+    /// strategy decides when the driver returns.
+    pub async fn reload_until(&self, wait: WaitUntil) -> Result<()> {
+        let ready = match wait {
+            WaitUntil::Ready => self.hooks().ready_script(),
+            WaitUntil::Commit | WaitUntil::DomContentLoaded | WaitUntil::Load => None,
+        };
+        if ready.is_some() {
+            self.stamp_navigation().await;
+        }
         match &self.inner.target {
             PageTarget::Bidi(context) => {
+                let wanted = load_phase(wait, ready.is_some());
                 let since = self.inner.events.navigation.borrow().started;
                 self.bidi_handle()?
                     .send_within(
@@ -650,9 +664,11 @@ impl Page {
                         self.default_timeout(),
                     )
                     .await?;
-                self.settle_navigation(since, LoadPhase::Loaded)
-                    .await
-                    .context("reload")?;
+                if let Some(wanted) = wanted {
+                    self.settle_navigation(since, wanted)
+                        .await
+                        .context("reload")?;
+                }
             }
             PageTarget::Classic(_) => {
                 let window = self.classic_window().await?;
@@ -660,6 +676,9 @@ impl Page {
                 drop(window);
                 self.fail_on_error_page().await.context("reload")?;
             }
+        }
+        if let Some(script) = ready {
+            self.wait_for_ready(&script, self.default_timeout()).await?;
         }
         Ok(())
     }
@@ -1420,6 +1439,18 @@ impl Page {
                         self.driver()
                             .execute(body.clone(), args.clone())
                             .await
+                            .map_err(|failure| {
+                                let replaced = matches!(
+                                    failure.as_inner(),
+                                    WebDriverErrorInner::StaleElementReference(_)
+                                );
+                                let failure = anyhow::Error::new(failure);
+                                if replaced {
+                                    failure.context(TargetReplaced)
+                                } else {
+                                    failure
+                                }
+                            })
                             .context("execute script")?
                             .convert::<serde_json::Value>()
                             .context("read the pointer origin")
@@ -1954,9 +1985,42 @@ impl Page {
                 duration_ms: Some(request.duration_ms),
                 request_headers: Vec::new(),
                 response_headers: Vec::new(),
+                initiator_type: None,
             });
         }
         Ok(())
+    }
+
+    /// Wait until no fetch or XHR request has been in flight for `quiet`, as
+    /// Playwright's `networkidle`. Past `deadline` it fails, naming the requests
+    /// still open. Over Classic only finished requests are seen, so it waits for
+    /// `quiet` alone.
+    pub async fn wait_for_network_idle(&self, quiet: Duration, deadline: Duration) -> Result<()> {
+        let give_up = tokio::time::Instant::now()
+            .checked_add(deadline)
+            .context("the network-idle deadline overflows the clock")?;
+        let mut activity = self.inner.events.activity.subscribe();
+        loop {
+            self.sync_capture().await?;
+            activity.borrow_and_update();
+            let open = self.inner.events.open_fetches();
+            let woke = if open.is_empty() {
+                match tokio::time::timeout(quiet, activity.changed()).await {
+                    Err(_) => return Ok(()),
+                    Ok(woke) => woke,
+                }
+            } else {
+                match tokio::time::timeout_at(give_up, activity.changed()).await {
+                    Err(_) => bail!(
+                        "the page still had {} request(s) in flight after {deadline:?}: {}",
+                        open.len(),
+                        open.join(", ")
+                    ),
+                    Ok(woke) => woke,
+                }
+            };
+            woke.context("the page's event stream ended")?;
+        }
     }
 
     // ── routing ────────────────────────────────────────────────────────────
@@ -2287,3 +2351,27 @@ pub(crate) fn abbreviate(script: &str) -> String {
         flat
     }
 }
+
+/// The load phase a BiDi navigation waits for; `None` returns at commit, which
+/// is also where a ready-script wait starts.
+fn load_phase(wait: WaitUntil, has_ready_script: bool) -> Option<LoadPhase> {
+    match wait {
+        WaitUntil::Commit => None,
+        WaitUntil::Ready if has_ready_script => None,
+        WaitUntil::DomContentLoaded => Some(LoadPhase::DomContentLoaded),
+        WaitUntil::Load | WaitUntil::Ready => Some(LoadPhase::Loaded),
+    }
+}
+
+/// The pointer's target was replaced before any input was sent, as an element
+/// is when its frame restarts its document, so the action can aim again.
+#[derive(Debug)]
+pub(crate) struct TargetReplaced;
+
+impl std::fmt::Display for TargetReplaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the target element was replaced before the pointer reached it")
+    }
+}
+
+impl std::error::Error for TargetReplaced {}

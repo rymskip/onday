@@ -963,21 +963,37 @@
         return element.isConnected && !!modal;
     }
 
-    // As `checkElementStates`: stable first, over animation frames, then the rest.
-    function elementIsStable(node) {
+    const FRAME_MS = 16;
+
+    // The next animation frame. A hidden document, as in a minimized window,
+    // renders no frames, so there a frame's worth of time stands in for one.
+    function nextFrame() {
         return new Promise((resolve) => {
-            let lastRect;
-            const check = () => {
-                const element = retarget(node, 'no-follow-label');
-                if (!element || !element.isConnected) return resolve('notconnected');
-                const box = element.getBoundingClientRect();
-                const rect = [box.top, box.left, box.width, box.height];
-                if (lastRect) return resolve(rect.every((value, index) => value === lastRect[index]));
-                lastRect = rect;
-                requestAnimationFrame(check);
+            const hidden = () => {
+                if (document.visibilityState === 'hidden') setTimeout(done, FRAME_MS);
             };
-            requestAnimationFrame(check);
+            const done = () => {
+                document.removeEventListener('visibilitychange', hidden);
+                resolve();
+            };
+            if (document.visibilityState === 'hidden') return void setTimeout(done, FRAME_MS);
+            document.addEventListener('visibilitychange', hidden);
+            requestAnimationFrame(done);
         });
+    }
+
+    // As `checkElementStates`: stable first, over animation frames, then the rest.
+    async function elementIsStable(node) {
+        let lastRect;
+        for (;;) {
+            await nextFrame();
+            const element = retarget(node, 'no-follow-label');
+            if (!element || !element.isConnected) return 'notconnected';
+            const box = element.getBoundingClientRect();
+            const rect = [box.top, box.left, box.width, box.height];
+            if (lastRect) return rect.every((value, index) => value === lastRect[index]);
+            lastRect = rect;
+        }
     }
 
     async function pointerStates(node, requireEnabled) {

@@ -9,9 +9,9 @@ use thirtyfour::bidi::modules::browser::{
     DownloadBehavior, RemoveUserContext, SetDownloadBehavior,
 };
 use thirtyfour::bidi::modules::browsing_context::{CreateType, GetTree};
-use thirtyfour::{Cookie, SameSite};
 
 use crate::browser::{Browser, BrowserInner, Session};
+use crate::cookie::{Cookie, SameSite};
 use crate::events::DialogPolicy;
 use crate::hooks::{self, AppHooks};
 use crate::js;
@@ -304,31 +304,28 @@ impl BrowserContext {
                 Ok(result
                     .cookies
                     .into_iter()
-                    .map(|cookie| {
-                        let mut out = Cookie::new(cookie.name, cookie.value.as_text());
-                        out.domain = Some(cookie.domain);
-                        out.path = Some(cookie.path);
-                        out.secure = Some(cookie.secure);
-                        out.http_only = Some(cookie.http_only);
-                        out.expiry = cookie.expiry;
-                        out.same_site = cookie.same_site.as_deref().and_then(|value| match value {
-                            "strict" => Some(SameSite::Strict),
-                            "lax" => Some(SameSite::Lax),
-                            "none" => Some(SameSite::None),
-                            "default" => Some(SameSite::Default),
-                            _ => None,
-                        });
-                        out
+                    .map(|cookie| Cookie {
+                        value: cookie.value.as_text(),
+                        name: cookie.name,
+                        domain: Some(cookie.domain),
+                        path: Some(cookie.path),
+                        expires: cookie.expiry,
+                        http_only: Some(cookie.http_only),
+                        secure: Some(cookie.secure),
+                        same_site: cookie.same_site.as_deref().and_then(SameSite::from_wire),
                     })
                     .collect())
             }
-            None => self
+            None => Ok(self
                 .inner
                 .session
                 .driver
                 .get_all_cookies()
                 .await
-                .context("read cookies"),
+                .context("read cookies")?
+                .into_iter()
+                .map(Cookie::from)
+                .collect()),
         }
     }
 
@@ -353,8 +350,8 @@ impl BrowserContext {
                             secure: cookie.secure,
                             same_site: cookie
                                 .same_site
-                                .map(|same_site| format!("{same_site:?}").to_lowercase()),
-                            expiry: cookie.expiry,
+                                .map(|same_site| same_site.as_str().to_string()),
+                            expiry: cookie.expires,
                         },
                         partition: self.partition(),
                     })
@@ -365,7 +362,7 @@ impl BrowserContext {
                     .inner
                     .session
                     .driver
-                    .add_cookie(cookie.clone())
+                    .add_cookie(thirtyfour::Cookie::from(cookie.clone()))
                     .await
                     .with_context(|| format!("add cookie {}", cookie.name))?,
             }
